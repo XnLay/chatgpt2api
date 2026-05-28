@@ -14,10 +14,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from curl_cffi import requests
+import requests
+import urllib3
+from curl_cffi import requests as curl_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from services.account_service import account_service
 from services.register import mail_provider
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -188,12 +194,26 @@ def _is_cloudflare_challenge(resp) -> bool:
         return False
     text = str(getattr(resp, "text", "") or "").lower()
     headers = getattr(resp, "headers", {}) or {}
+    content_type = str(headers.get("content-type") or "").lower()
+    cf_mitigated = str(headers.get("cf-mitigated") or "").lower()
     server = str(headers.get("server") or "").lower()
-    return (
-        "cloudflare" in server
-        or "challenges.cloudflare.com" in text
-        or "<title>just a moment" in text
+    if cf_mitigated == "challenge":
+        return True
+    challenge_markers = (
+        "challenges.cloudflare.com",
+        "/cdn-cgi/challenge-platform",
+        "cf-chl-",
+        "cf_chl_",
+        "cf-browser-verification",
+        "<title>just a moment",
+        "attention required! | cloudflare",
+        "enable cookies",
     )
+    if any(marker in text for marker in challenge_markers):
+        return True
+    # Cloudflare 也常作为正常 API 网关，单独的 `server: cloudflare`
+    # 不能视为拦截；只有返回 HTML 挑战页特征时才判定为 Cloudflare challenge。
+    return "cloudflare" in server and "text/html" in content_type and "challenge" in text
 
 
 def create_mailbox(username: str | None = None) -> dict:
@@ -302,11 +322,23 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
 
 
+def _is_socks_proxy(proxy: str) -> bool:
+    candidate = str(proxy or "").strip().lower()
+    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
+
+
 def create_session(proxy: str = "") -> Any:
-    kwargs = {"impersonate": "chrome", "verify": False}
+    if _is_socks_proxy(proxy):
+        return curl_requests.Session(impersonate="chrome", verify=False, proxy=proxy)
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = False
     if proxy:
-        kwargs["proxy"] = proxy
-    return requests.Session(**kwargs)
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
@@ -431,14 +463,15 @@ class PlatformRegistrar:
             "auth0Client": platform_auth0_client,
         }
         resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code != 200:
-            err = _response_json(resp).get("error", {}) if resp is not None else {}
+        if resp is None:
+            raise RuntimeError(error or "platform_authorize_failed")
+        if _is_cloudflare_challenge(resp):
+            raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
+        if resp.status_code != 200:
+            err = _response_json(resp).get("error", {})
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
             debug = _response_debug_detail(resp)
-            status = getattr(resp, "status_code", "unknown")
-            raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
+            step(index, f"platform authorize 返回 HTTP {resp.status_code}{detail}，继续使用已建立的授权会话；{debug}", "yellow")
         step(index, "platform authorize 完成")
 
     def _register_user(self, email: str, password: str, index: int) -> None:

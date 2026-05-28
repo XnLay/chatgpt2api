@@ -1,0 +1,115 @@
+import unittest
+
+import requests
+
+from services.register import openai_register
+
+
+class _FakeCookies:
+    def __init__(self):
+        self.items = []
+
+    def set(self, *args, **kwargs):
+        self.items.append((args, kwargs))
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, headers=None, text="", url="https://auth.openai.com/test"):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self.url = url
+
+    def json(self):
+        return {}
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self.response = response
+        self.cookies = _FakeCookies()
+        self.requests = []
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        return self.response
+
+
+class OpenAIRegisterCloudflareTests(unittest.TestCase):
+    def test_create_session_uses_requests_for_plain_and_http_proxy(self):
+        plain_session = openai_register.create_session("")
+        proxied_session = openai_register.create_session("http://127.0.0.1:8080")
+
+        try:
+            self.assertIsInstance(plain_session, requests.Session)
+            self.assertIsInstance(proxied_session, requests.Session)
+            self.assertEqual(proxied_session.proxies["http"], "http://127.0.0.1:8080")
+            self.assertEqual(proxied_session.proxies["https"], "http://127.0.0.1:8080")
+        finally:
+            plain_session.close()
+            proxied_session.close()
+
+    def test_create_session_keeps_curl_for_socks_proxy(self):
+        session = openai_register.create_session("socks5://127.0.0.1:1080")
+
+        try:
+            self.assertNotIsInstance(session, requests.Session)
+            self.assertEqual(session.proxies["all"], "socks5://127.0.0.1:1080")
+        finally:
+            session.close()
+
+    def test_cloudflare_server_header_alone_is_not_challenge(self):
+        resp = _FakeResponse(
+            status_code=409,
+            headers={"server": "cloudflare", "content-type": "application/json"},
+            text='{"error":"authorization_pending"}',
+        )
+
+        self.assertFalse(openai_register._is_cloudflare_challenge(resp))
+
+    def test_cloudflare_challenge_html_is_detected(self):
+        resp = _FakeResponse(
+            status_code=403,
+            headers={"server": "cloudflare", "content-type": "text/html"},
+            text="<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/b'></script></html>",
+        )
+
+        self.assertTrue(openai_register._is_cloudflare_challenge(resp))
+
+    def test_platform_authorize_continues_for_non_challenge_cloudflare_gateway_response(self):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = _FakeSession(
+            _FakeResponse(
+                status_code=409,
+                headers={"server": "cloudflare", "content-type": "application/json"},
+                text='{"error":"authorization_pending"}',
+            )
+        )
+        registrar.device_id = "device-id"
+        registrar.code_verifier = ""
+        registrar.platform_auth_code = ""
+
+        registrar._platform_authorize("user@example.com", 1)
+
+        self.assertTrue(registrar.code_verifier)
+        self.assertEqual(len(registrar.session.requests), 1)
+
+    def test_platform_authorize_still_rejects_real_cloudflare_challenge(self):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = _FakeSession(
+            _FakeResponse(
+                status_code=403,
+                headers={"server": "cloudflare", "content-type": "text/html", "cf-mitigated": "challenge"},
+                text="<html><title>Just a moment...</title></html>",
+            )
+        )
+        registrar.device_id = "device-id"
+        registrar.code_verifier = ""
+        registrar.platform_auth_code = ""
+
+        with self.assertRaisesRegex(RuntimeError, "Cloudflare"):
+            registrar._platform_authorize("user@example.com", 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
