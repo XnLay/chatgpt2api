@@ -32,6 +32,21 @@ cd chatgpt2api
 docker compose up -d
 ```
 
+如果使用你自己的 Fork，推送到 `main` 分支或打 `v*` 标签后，GitHub Actions 会自动构建并发布镜像：
+
+```text
+ghcr.io/<your-github-user>/chatgpt2api:latest
+```
+
+在本地或容器平台部署自建镜像时，将镜像地址替换为你的 GHCR 地址即可：
+
+```bash
+CHATGPT2API_IMAGE=ghcr.io/<your-github-user>/chatgpt2api:latest docker compose up -d
+```
+
+> [!TIP]
+> GHCR 包首次发布后可能默认为私有。如果容器平台无法拉取镜像，请在 GitHub Package 设置里将镜像改为 Public，或在容器平台配置 GHCR 拉取凭据。
+
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
 - Web 面板：`http://localhost:3000`
