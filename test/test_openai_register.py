@@ -94,7 +94,7 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         self.assertTrue(registrar.code_verifier)
         self.assertEqual(len(registrar.session.requests), 1)
 
-    def test_platform_authorize_still_rejects_real_cloudflare_challenge(self):
+    def test_platform_authorize_continues_for_cloudflare_challenge_compatibility(self):
         registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
         registrar.session = _FakeSession(
             _FakeResponse(
@@ -107,8 +107,10 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         registrar.code_verifier = ""
         registrar.platform_auth_code = ""
 
-        with self.assertRaisesRegex(RuntimeError, "Cloudflare"):
-            registrar._platform_authorize("user@example.com", 1)
+        registrar._platform_authorize("user@example.com", 1)
+
+        self.assertTrue(registrar.code_verifier)
+        self.assertEqual(len(registrar.session.requests), 1)
 
 
 if __name__ == "__main__":
