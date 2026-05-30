@@ -2,7 +2,7 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
-export type ImageModel = "gpt-image-2" | "codex-gpt-image-2";
+export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
 
@@ -13,12 +13,13 @@ export type ImageStorageSettings = {
   webdav_username: string;
   webdav_password: string;
   webdav_root_path: string;
-  public_base_url?: string;
+  public_base_url: string;
 };
 
 export type Account = {
   access_token: string;
   type: AccountType;
+  source_type?: string | null;
   status: AccountStatus;
   quota: number;
   image_quota_unknown?: boolean;
@@ -34,10 +35,35 @@ export type Account = {
   success: number;
   fail: number;
   last_used_at?: string | null;
+  proxy?: string | null;
+};
+
+export type AccountImportPayload = {
+  access_token: string;
+  accessToken?: string;
+  type?: string;
+  export_type?: string;
+  source_type?: string;
+  [key: string]: unknown;
+};
+
+export type Model = {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+  permission: unknown[];
+  root: string;
+  parent: string | null;
 };
 
 type AccountListResponse = {
   items: Account[];
+};
+
+type ModelListResponse = {
+  object: string;
+  data: Model[];
 };
 
 type AccountMutationResponse = {
@@ -79,9 +105,9 @@ export type SettingsConfig = {
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   log_levels?: string[];
+  image_storage?: ImageStorageSettings;
   backup?: BackupSettings;
   backup_state?: BackupState;
-  image_storage?: ImageStorageSettings;
   [key: string]: unknown;
 };
 
@@ -267,10 +293,35 @@ export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
 }
 
-export async function createAccounts(tokens: string[]) {
+export async function fetchModels() {
+  return httpRequest<ModelListResponse>("/v1/models");
+}
+
+export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
-    body: { tokens },
+    body: { tokens, accounts },
+  });
+}
+
+export type OAuthLoginStartResponse = {
+  session_id: string;
+  authorize_url: string;
+  expires_in: string;
+  redirect_uri_prefix: string;
+};
+
+export async function startOAuthLogin(emailHint?: string) {
+  return httpRequest<OAuthLoginStartResponse>("/api/accounts/oauth/start", {
+    method: "POST",
+    body: { email_hint: emailHint ?? "" },
+  });
+}
+
+export async function finishOAuthLogin(sessionId: string, callback: string) {
+  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
+    method: "POST",
+    body: { session_id: sessionId, callback },
   });
 }
 
@@ -294,6 +345,7 @@ export async function updateAccount(
     type?: AccountType;
     status?: AccountStatus;
     quota?: number;
+    proxy?: string;
   },
 ) {
   return httpRequest<AccountUpdateResponse>("/api/accounts/update", {
@@ -412,6 +464,20 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
 
 export async function testBackupConnection() {
   return httpRequest<{ result: { ok: boolean; status: number } }>("/api/backup/test", {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function testImageStorageConnection() {
+  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function syncImageStorage() {
+  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
     method: "POST",
     body: {},
   });

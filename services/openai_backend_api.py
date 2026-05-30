@@ -1,8 +1,11 @@
 import base64
+import json
 import os
 import random
 import re
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
@@ -15,7 +18,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid
+from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -43,6 +46,17 @@ DEFAULT_CLIENT_VERSION = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 DEFAULT_CLIENT_BUILD_NUMBER = "5955942"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+CODEX_RESPONSES_MODEL = "gpt-5.5"
+SEARCH_MODEL = "gpt-5-5"
+SEARCH_TIMEOUT_SECS = 300.0
+SEARCH_POLL_INTERVAL_SECS = 3.0
+SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
+SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
+CODEX_RESPONSES_INSTRUCTIONS = (
+    "Use the image_generation tool to create exactly one image for the user's request. "
+    "Return the generated image result."
+)
 
 
 class OpenAIBackendAPI:
@@ -67,6 +81,8 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self.account = account_service.get_account(self.access_token) if self.access_token else {}
+        self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
@@ -74,6 +90,7 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
         ))
@@ -107,8 +124,7 @@ class OpenAIBackendAPI:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
     def _build_fp(self) -> Dict[str, str]:
-        account = account_service.get_account(self.access_token) if self.access_token else {}
-        account = account if isinstance(account, dict) else {}
+        account = self.account
         raw_fp = account.get("fp")
         fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
         for key in (
@@ -399,13 +415,13 @@ class OpenAIBackendAPI:
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
-        model = str(model or "").strip()
-        if not model:
+        _, base_model = split_image_model(model)
+        if not base_model:
             return "auto"
-        if model == "gpt-image-2":
+        if base_model == "gpt-image-2":
             return "gpt-5-3"
-        if model == CODEX_IMAGE_MODEL:
-            return model
+        if base_model == CODEX_IMAGE_MODEL:
+            return base_model
         return "auto"
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
@@ -423,6 +439,274 @@ class OpenAIBackendAPI:
         if accept == "text/event-stream":
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
         return self._headers(path, headers)
+
+    def _codex_responses_headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _ensure_codex_source_account(self) -> None:
+        account = account_service.get_account(self.access_token)
+        source_type = str((account or {}).get("source_type") or "web").strip().lower()
+        if source_type != "codex":
+            raise RuntimeError("codex responses endpoint requires a codex source account")
+
+    @staticmethod
+    def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
+        content: list[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for image in images:
+            payload = image if image.startswith("data:image/") else f"data:image/png;base64,{image}"
+            content.append({"type": "input_image", "image_url": payload})
+        return [{"role": "user", "content": content}]
+
+    @staticmethod
+    def _codex_body_preview(body: Any, limit: int = 4000) -> str:
+        if isinstance(body, (dict, list)):
+            try:
+                text = json.dumps(body, ensure_ascii=False)
+            except Exception:
+                text = repr(body)
+        else:
+            text = str(body or "")
+        return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+    @staticmethod
+    def _codex_event_image_result_lengths(value: Any) -> list[int]:
+        if isinstance(value, dict):
+            lengths: list[int] = []
+            if value.get("type") == "image_generation_call" and isinstance(value.get("result"), str):
+                lengths.append(len(value["result"]))
+            for item in value.values():
+                lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(item))
+            return lengths
+        if isinstance(value, list):
+            lengths: list[int] = []
+            for item in value:
+                lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(item))
+            return lengths
+        return []
+
+    @staticmethod
+    def _codex_event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "type": str(event.get("type") or ""),
+            "keys": list(event.keys())[:30],
+        }
+        for key in ("id", "status", "sequence_number", "response_id", "item_id", "output_index", "content_index"):
+            value = event.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                summary[key] = value
+        for key in ("response", "item", "output"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                summary[f"{key}_type"] = value.get("type")
+                summary[f"{key}_status"] = value.get("status")
+                summary[f"{key}_keys"] = list(value.keys())[:30]
+            elif isinstance(value, list):
+                summary[f"{key}_len"] = len(value)
+                summary[f"{key}_types"] = [
+                    item.get("type") for item in value[:10] if isinstance(item, dict)
+                ]
+        error = event.get("error")
+        if isinstance(error, dict):
+            summary["error"] = {
+                key: error.get(key)
+                for key in ("type", "code", "message")
+                if error.get(key) is not None
+            }
+        delta = event.get("delta")
+        if isinstance(delta, str):
+            summary["delta_len"] = len(delta)
+            summary["delta_preview"] = delta[:200]
+        result_lengths = OpenAIBackendAPI._codex_event_image_result_lengths(event)
+        if result_lengths:
+            summary["image_result_lengths"] = result_lengths[:10]
+        return summary
+
+    def _log_codex_response_failure(
+            self,
+            path: str,
+            status_code: int,
+            headers: Any,
+            payload: Dict[str, Any],
+            body: Any,
+    ) -> None:
+        request_headers = self._codex_responses_headers()
+        safe_request_headers = {
+            key: value for key, value in request_headers.items() if key.lower() != "authorization"
+        }
+        response_headers = dict(headers.items()) if hasattr(headers, "items") else dict(headers or {})
+        tool = ((payload.get("tools") or [{}])[0]) if isinstance(payload.get("tools"), list) else {}
+        logger.warning({
+            "event": "codex_responses_http_error",
+            "path": path,
+            "status_code": status_code,
+            "request": {
+                "model": payload.get("model"),
+                "tool_model": tool.get("model"),
+                "tool_action": tool.get("action"),
+                "size": tool.get("size"),
+                "quality": tool.get("quality"),
+                "image_input_count": max(len((payload.get("input") or [{}])[0].get("content") or []) - 1, 0),
+                "prompt_preview": self._codex_body_preview(
+                    (((payload.get("input") or [{}])[0].get("content") or [{}])[0].get("text") or ""),
+                    500,
+                ),
+                "headers": safe_request_headers,
+            },
+            "response": {
+                "headers": response_headers,
+                "body_preview": self._codex_body_preview(body),
+            },
+        })
+
+    @staticmethod
+    def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
+        content_type = str(raw.headers.get("content-type") or "").lower()
+        text = raw.read().decode("utf-8", "replace")
+        status_code = getattr(raw, "status", None)
+        parse_errors: list[str] = []
+        events: list[Dict[str, Any]] = []
+        if "application/json" in content_type:
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    events.append(data)
+            except Exception as exc:
+                parse_errors.append(str(exc))
+        else:
+            lines: list[str] = []
+            for line in text.splitlines() + [""]:
+                if not line:
+                    if lines:
+                        payload_text = "\n".join(lines).strip()
+                        if payload_text and payload_text != "[DONE]":
+                            try:
+                                data = json.loads(payload_text)
+                            except Exception as exc:
+                                parse_errors.append(str(exc))
+                                data = None
+                            if isinstance(data, dict):
+                                events.append(data)
+                        lines = []
+                elif line.startswith("data:"):
+                    lines.append(line[5:].lstrip())
+
+        event_types: Dict[str, int] = {}
+        image_result_lengths: list[int] = []
+        for event in events:
+            event_type = str(event.get("type") or "<missing>")
+            event_types[event_type] = event_types.get(event_type, 0) + 1
+            image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
+        logger.info({
+            "event": "codex_responses_response_debug",
+            "status_code": status_code,
+            "content_type": content_type,
+            "response_text_len": len(text),
+            "event_count": len(events),
+            "event_types": event_types,
+            "image_result_lengths": image_result_lengths[:10],
+            "parse_error_count": len(parse_errors),
+            "parse_errors": parse_errors[:5],
+            "event_summaries": [OpenAIBackendAPI._codex_event_summary(event) for event in events[:30]],
+            "event_previews": [
+                OpenAIBackendAPI._codex_body_preview(event, 1500)
+                for event in events[:10]
+            ] if not image_result_lengths else [],
+            "body_preview": text[:1000] if not events else "",
+        })
+        for event in events:
+            yield event
+
+    def iter_codex_image_response_events(
+            self,
+            prompt: str,
+            images: list[str] | None = None,
+            size: str | None = None,
+            quality: str = "auto",
+    ) -> Iterator[Dict[str, Any]]:
+        if not self.access_token:
+            raise RuntimeError("access_token is required for codex image endpoints")
+        self._ensure_codex_source_account()
+        path = "/backend-api/codex/responses"
+        payload = {
+            "model": CODEX_RESPONSES_MODEL,
+            "instructions": CODEX_RESPONSES_INSTRUCTIONS,
+            "store": False,
+            "input": self._codex_image_input(prompt, images or []),
+            "tools": [{
+                "type": "image_generation",
+                "model": "gpt-image-2",
+                "action": "edit" if images else "generate",
+                "size": str(size or "1024x1024"),
+                "quality": str(quality or "auto"),
+                "output_format": "png",
+            }],
+            "tool_choice": {"type": "image_generation"},
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            self.base_url + path,
+            json.dumps(payload).encode(),
+            self._codex_responses_headers(),
+            method="POST",
+        )
+        account = account_service.get_account(self.access_token) or {}
+        token_payload = account_service._decode_jwt_payload(self.access_token)
+        auth_claim = token_payload.get("https://api.openai.com/auth")
+        auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+        tool = payload["tools"][0]
+        logger.info({
+            "event": "codex_responses_request_debug",
+            "url": self.base_url + path,
+            "transport": "urllib.request",
+            "timeout_secs": 1200,
+            "account_email": str(account.get("email") or "").strip(),
+            "source_type": str(account.get("source_type") or "").strip(),
+            "account_type": str(account.get("type") or "").strip(),
+            "token_claims": {
+                "jti": token_payload.get("jti"),
+                "iat": token_payload.get("iat"),
+                "exp": token_payload.get("exp"),
+                "client_id": token_payload.get("client_id"),
+                "chatgpt_account_id": auth_claim.get("chatgpt_account_id"),
+                "chatgpt_plan_type": auth_claim.get("chatgpt_plan_type"),
+                "localhost": auth_claim.get("localhost"),
+            },
+            "request": {
+                "model": payload.get("model"),
+                "tool_model": tool.get("model"),
+                "tool_action": tool.get("action"),
+                "size": tool.get("size"),
+                "quality": tool.get("quality"),
+                "output_format": tool.get("output_format"),
+                "stream": payload.get("stream"),
+                "image_input_count": max(len((payload.get("input") or [{}])[0].get("content") or []) - 1, 0),
+                "prompt_preview": self._codex_body_preview(
+                    (((payload.get("input") or [{}])[0].get("content") or [{}])[0].get("text") or ""),
+                    500,
+                ),
+            },
+            "headers": {
+                key: value for key, value in self._codex_responses_headers().items()
+                if key.lower() != "authorization"
+            },
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=1200) as raw:
+                yield from self._iter_codex_response_events(raw)
+        except urllib.error.HTTPError as error:
+            body_text = error.read().decode("utf-8", "replace")
+            body: Any = body_text
+            try:
+                body = json.loads(body_text)
+            except Exception:
+                pass
+            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
+            retry_after_header = error.headers.get("Retry-After") if error.headers else None
+            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -610,6 +894,202 @@ class OpenAIBackendAPI:
                                     timeout=60)
         ensure_ok(response, path)
         return response.json()
+
+    def search(self, prompt: str, model: str = SEARCH_MODEL, timeout_secs: float = SEARCH_TIMEOUT_SECS,
+               poll_interval_secs: float = SEARCH_POLL_INTERVAL_SECS) -> Dict[str, Any]:
+        if not self.access_token:
+            raise RuntimeError("access_token is required for search")
+        conduit_token = self._prepare_search_conversation(prompt, model)
+        self._bootstrap()
+        conversation_id = self._run_search_conversation(prompt, conduit_token, model)
+        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+
+    def _prepare_search_conversation(self, prompt: str, model: str) -> str:
+        path = "/backend-api/f/conversation/prepare"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+            json={
+                "action": "next",
+                "fork_from_shared_post": False,
+                "parent_message_id": "client-created-root",
+                "model": model,
+                "client_prepare_state": "success",
+                "timezone_offset_min": -480,
+                "timezone": "Asia/Shanghai",
+                "conversation_mode": {"kind": "primary_assistant"},
+                "system_hints": ["search"],
+                "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
+                "supports_buffering": True,
+                "supported_encodings": ["v1"],
+                "client_contextual_info": {"app_name": "chatgpt.com"},
+            },
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        token = str(response.json().get("conduit_token") or "")
+        if not token:
+            raise RuntimeError("missing conduit_token")
+        return token
+
+    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
+        requirements = self._get_chat_requirements()
+        path = "/backend-api/f/conversation"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            json={
+                "action": "next",
+                "messages": [{
+                    "id": new_uuid(),
+                    "author": {"role": "user"},
+                    "create_time": time.time(),
+                    "content": {"content_type": "text", "parts": [prompt]},
+                    "metadata": {
+                        "developer_mode_connector_ids": [],
+                        "selected_github_repos": [],
+                        "selected_all_github_repos": False,
+                        "system_hints": ["search"],
+                        "serialization_metadata": {"custom_symbol_offsets": []},
+                    },
+                }],
+                "parent_message_id": "client-created-root",
+                "model": model,
+                "client_prepare_state": "success",
+                "timezone_offset_min": -480,
+                "timezone": "Asia/Shanghai",
+                "conversation_mode": {"kind": "primary_assistant"},
+                "enable_message_followups": True,
+                "system_hints": [],
+                "supports_buffering": True,
+                "supported_encodings": ["v1"],
+                "force_use_search": True,
+                "client_reported_search_source": "conversation_composer_web_icon",
+                "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 36, "page_height": 925, "page_width": 886, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"},
+                "paragen_cot_summary_display_override": "allow",
+                "force_parallel_switch": "auto",
+            },
+            timeout=300,
+            stream=True,
+        )
+        ensure_ok(response, path)
+        conversation_id = ""
+        try:
+            for payload in iter_sse_payloads(response):
+                conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
+                if payload == "[DONE]":
+                    break
+        finally:
+            response.close()
+        if not conversation_id:
+            raise RuntimeError("conversation_id not found in stream")
+        return conversation_id
+
+    def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
+        deadline = time.time() + timeout_secs
+        last_result: Dict[str, Any] | None = None
+        while time.time() < deadline:
+            try:
+                last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
+            except UpstreamHTTPError as exc:
+                if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
+                    raise
+            if last_result and last_result.get("answer") and last_result.get("status") in SEARCH_DONE_STATUS:
+                return last_result
+            time.sleep(poll_interval_secs)
+        if last_result:
+            return last_result
+        raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
+
+    def _get_search_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        path = f"/backend-api/conversation/{conversation_id}"
+        headers = self._headers(path, {"Accept": "*/*"})
+        headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
+        headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
+        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        ensure_ok(response, path)
+        return response.json()
+
+    def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
+        messages = []
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            if ((message.get("author") or {}).get("role") or "") == "assistant":
+                messages.append(message)
+        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+        finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
+        answer = self._search_message_text(message)
+        sources = self._extract_search_sources(message)
+        for url in SEARCH_URL_RE.findall(answer):
+            url = self._clean_search_url(url)
+            if url and all(item["url"] != url for item in sources):
+                sources.append({"title": "", "url": url, "snippet": "", "source_type": ""})
+        return {
+            "conversation_id": conversation_id,
+            "status": str(finish_details.get("type") or metadata.get("status") or self._find_search_value(message, "status") or "").strip(),
+            "answer": answer,
+            "sources": sources,
+            "assistant_message_id": str(message.get("id") or ""),
+            "create_time": float(message.get("create_time") or 0.0),
+        }
+
+    def _extract_search_sources(self, payload: Any) -> list[Dict[str, str]]:
+        sources: list[Dict[str, str]] = []
+        for obj in self._walk_search_dicts(payload):
+            metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            url = self._clean_search_url(obj.get("url") or obj.get("link") or obj.get("source_url") or metadata.get("url"))
+            if url and all(item["url"] != url for item in sources):
+                sources.append({
+                    "title": str(obj.get("title") or obj.get("name") or obj.get("source") or "").strip(),
+                    "url": url,
+                    "snippet": str(obj.get("snippet") or obj.get("text") or obj.get("description") or "").strip(),
+                    "source_type": str(obj.get("type") or obj.get("source_type") or "").strip(),
+                })
+        return sources
+
+    def _search_message_text(self, message: Any) -> str:
+        content = message.get("content") if isinstance(message, dict) else {}
+        parts = []
+        if isinstance(content, dict):
+            if isinstance(content.get("text"), str):
+                parts.append(content["text"])
+            for part in content.get("parts") or []:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    parts.extend(str(part.get(key) or "") for key in ("text", "summary", "content") if part.get(key))
+        elif isinstance(content, str):
+            parts.append(content)
+        return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+
+    def _find_search_value(self, payload: Any, key: str) -> str:
+        if isinstance(payload, str):
+            match = SEARCH_CONVERSATION_ID_RE.search(payload) if key == "conversation_id" else None
+            if match:
+                return match.group(1)
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return ""
+        if isinstance(payload, dict):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+            return next((found for item in payload.values() if (found := self._find_search_value(item, key))), "")
+        if isinstance(payload, list):
+            return next((found for item in payload if (found := self._find_search_value(item, key))), "")
+        return ""
+
+    def _walk_search_dicts(self, payload: Any) -> list[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            return [payload, *(item for value in payload.values() for item in self._walk_search_dicts(value))]
+        if isinstance(payload, list):
+            return [item for value in payload for item in self._walk_search_dicts(value)]
+        return []
+
+    def _clean_search_url(self, value: Any) -> str:
+        return str(value or "").strip().rstrip(".,;，。；")
 
     def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
         """从 conversation 明细里提取图片工具输出记录。"""
