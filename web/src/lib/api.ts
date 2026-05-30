@@ -469,20 +469,6 @@ export async function testBackupConnection() {
   });
 }
 
-export async function testImageStorageConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function syncImageStorage() {
-  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
-    method: "POST",
-    body: {},
-  });
-}
-
 export async function fetchBackups() {
   return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups");
 }
