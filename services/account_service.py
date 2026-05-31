@@ -21,6 +21,7 @@ class AccountService:
 
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
+    _INVALID_CONFIRM_COUNT = 3
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
@@ -224,6 +225,7 @@ class AccountService:
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
+        normalized["first_invalid_at"] = normalized.get("first_invalid_at") or None
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
@@ -399,6 +401,7 @@ class AccountService:
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
             next_item["invalid_count"] = 0
+            next_item["first_invalid_at"] = None
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
@@ -660,6 +663,16 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    def list_invalid_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if int(item.get("invalid_count") or 0) > 0
+                   and item.get("status") != "禁用"
+                   and (token := item.get("access_token") or "")
+            ]
+
     @staticmethod
     def _account_payload_token(item: dict) -> str:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()
@@ -802,6 +815,7 @@ class AccountService:
                 return
             next_item = dict(current)
             next_item["invalid_count"] = 0
+            next_item["first_invalid_at"] = None
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
@@ -812,14 +826,24 @@ class AccountService:
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
             return False
-        created_at = self._parse_time(account.get("created_at"))
-        if created_at is not None and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS:
-            return True
-        last_invalid_at = self._parse_time(account.get("last_invalid_at"))
         invalid_count = int(account.get("invalid_count") or 0)
-        if invalid_count <= 1:
+        next_invalid_count = invalid_count + 1
+        if next_invalid_count < self._INVALID_CONFIRM_COUNT:
             return True
-        if last_invalid_at is not None and (now - last_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS:
+        created_at = self._parse_time(account.get("created_at"))
+        if (
+                created_at is not None
+                and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS
+                and next_invalid_count <= self._INVALID_CONFIRM_COUNT
+        ):
+            return True
+        # 使用“首次异常时间”作为确认窗口锚点，避免频繁失败不断刷新 last_invalid_at 后永远无法确认异常。
+        first_invalid_at = self._parse_time(account.get("first_invalid_at")) or self._parse_time(account.get("last_invalid_at"))
+        if (
+                first_invalid_at is not None
+                and (now - first_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS
+                and next_invalid_count <= self._INVALID_CONFIRM_COUNT
+        ):
             return True
         return False
 
@@ -833,6 +857,7 @@ class AccountService:
             should_defer = self._should_defer_invalid_token(current, now)
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+            next_item["first_invalid_at"] = next_item.get("first_invalid_at") or next_item.get("last_invalid_at") or now.isoformat()
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()

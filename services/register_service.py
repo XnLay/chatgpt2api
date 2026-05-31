@@ -8,7 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services.account_service import account_service
+from services.account_service import AccountService, account_service
 from services.config import DATA_DIR
 from services.register import openai_register
 
@@ -123,10 +123,16 @@ class RegisterService:
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
-        normal = [item for item in items if item.get("status") == "正常"]
+        # 目标可用账号必须与真实图片候选池一致；待确认异常账号不再参与保号统计。
+        available = [
+            item
+            for item in items
+            if AccountService._is_image_account_available(item)
+               and int(item.get("invalid_count") or 0) <= 0
+        ]
         return {
-            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
-            "current_available": len(normal),
+            "current_quota": sum(int(item.get("quota") or 0) for item in available if not item.get("image_quota_unknown")),
+            "current_available": len(available),
         }
 
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
@@ -135,11 +141,11 @@ class RegisterService:
         self._bump(**metrics)
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            self._append_log(f"检查号池：当前可用账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            self._append_log(f"检查号池：当前可用账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 

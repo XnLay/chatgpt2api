@@ -9,6 +9,9 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
+from services.config import config
+import services.register_service as register_service_module
+from services.register_service import RegisterService
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -93,6 +96,68 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_invalid_token_is_eventually_removed_after_repeated_confirmations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-invalid"])
+            service.update_account(
+                "token-invalid",
+                {
+                    "status": "正常",
+                    "quota": 3,
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                },
+            )
+
+            decisions = [
+                service._record_invalid_token_seen("token-invalid", "test", "401")
+                for _ in range(4)
+            ]
+
+            self.assertEqual(decisions, [False, False, False, True])
+            self.assertEqual(service.list_invalid_tokens(), ["token-invalid"])
+
+            old_auto_remove = config.data.get("auto_remove_invalid_accounts")
+            config.data["auto_remove_invalid_accounts"] = True
+            try:
+                removed = service.remove_invalid_token("token-invalid", "test")
+                self.assertTrue(removed)
+                self.assertIsNone(service.get_account("token-invalid"))
+            finally:
+                if old_auto_remove is None:
+                    config.data.pop("auto_remove_invalid_accounts", None)
+                else:
+                    config.data["auto_remove_invalid_accounts"] = old_auto_remove
+
+    def test_register_pool_metrics_ignore_pending_invalid_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-ok", "status": "正常", "quota": 2},
+                    {
+                        "access_token": "token-pending",
+                        "status": "正常",
+                        "quota": 2,
+                        "invalid_count": 1,
+                        "first_invalid_at": "2000-01-01T00:00:00+00:00",
+                    },
+                    {"access_token": "token-zero", "status": "正常", "quota": 0},
+                ]
+            )
+
+            original_account_service = register_service_module.account_service
+            register_service_module.account_service = service
+            try:
+                register_service = RegisterService(Path(tmp_dir) / "register.json")
+                metrics = register_service._pool_metrics()
+
+                self.assertEqual(metrics["current_available"], 1)
+                self.assertEqual(metrics["current_quota"], 2)
+                self.assertFalse(register_service._target_reached({"mode": "available", "target_available": 2}, 0))
+            finally:
+                register_service_module.account_service = original_account_service
 
 
 class TokenLogTests(unittest.TestCase):
