@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -156,6 +157,44 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertEqual(metrics["current_available"], 1)
                 self.assertEqual(metrics["current_quota"], 2)
                 self.assertFalse(register_service._target_reached({"mode": "available", "target_available": 2}, 0))
+            finally:
+                register_service_module.account_service = original_account_service
+
+    def test_register_stop_wakes_idle_available_monitor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-1", "status": "正常", "quota": 3},
+                    {"access_token": "token-2", "status": "正常", "quota": 3},
+                ]
+            )
+
+            original_account_service = register_service_module.account_service
+            register_service_module.account_service = service
+            try:
+                register_service = RegisterService(Path(tmp_dir) / "register.json")
+                register_service.update(
+                    {
+                        "mode": "available",
+                        "target_available": 1,
+                        "check_interval": 60,
+                        "threads": 1,
+                    }
+                )
+                register_service.start()
+                self.assertIsNotNone(register_service._runner)
+
+                time.sleep(0.05)
+                register_service.stop()
+
+                deadline = time.monotonic() + 2
+                while register_service._runner and register_service._runner.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+
+                self.assertFalse(register_service._runner and register_service._runner.is_alive())
+                logs = [item["text"] for item in register_service.get()["logs"]]
+                self.assertIn("注册任务结束，成功0，失败0", logs)
             finally:
                 register_service_module.account_service = original_account_service
 

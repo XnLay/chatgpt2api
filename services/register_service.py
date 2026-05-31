@@ -45,6 +45,7 @@ class RegisterService:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
@@ -82,10 +83,12 @@ class RegisterService:
     def start(self) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
+                self._stop_event.clear()
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
             self._config["enabled"] = True
+            self._stop_event.clear()
             self._inject_proxy_to_mail()
             self._logs = []
             metrics = self._pool_metrics()
@@ -103,6 +106,7 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
+            self._stop_event.set()
             self._save()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
             return self.get()
@@ -182,7 +186,9 @@ class RegisterService:
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
+                    # 空闲保号监控使用可唤醒等待，避免停止时卡在较长 check_interval。
+                    if self._stop_event.wait(timeout=max(1, int(cfg.get("check_interval") or 5))):
+                        break
                     continue
                 finished, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in finished:
