@@ -3,11 +3,19 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 import json
+import base64
 
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
+from utils.helper import extract_image_from_message_content
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP8z8BQDwAFgwJ/luzl4wAAAABJRU5ErkJggg=="
+)
+PNG_1X1_DATA_URL = "data:image/png;base64," + base64.b64encode(PNG_1X1).decode("ascii")
 
 
 class ChatCompletionCacheTests(unittest.TestCase):
@@ -183,8 +191,24 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual(
             sanitize_output_text(text),
-            "Repo: basketikun/chatgpt2api (https://github.com/basketikun/chatgpt2api) details .",
+            "Repo: basketikun/chatgpt2api (https://github.com/basketikun/chatgpt2api) details.",
         )
+
+    def test_output_sanitizer_preserves_annotated_entity_text(self) -> None:
+        text = (
+            "The character is from \ue200entity\ue202Invincible\ue201, "
+            "which is based on the comic series \ue200entity\ue202Invincible\ue201."
+        )
+
+        self.assertEqual(
+            sanitize_output_text(text),
+            "The character is from Invincible, which is based on the comic series Invincible.",
+        )
+
+    def test_output_sanitizer_preserves_readable_cite_label(self) -> None:
+        text = "The character is \ue200cite\ue202Invincible\ue202turn0search0\ue201."
+
+        self.assertEqual(sanitize_output_text(text), "The character is Invincible.")
 
     def test_stream_sanitizer_does_not_emit_partial_annotation_or_repeat_prefix(self) -> None:
         events = [
@@ -199,7 +223,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
             if event.get("type") == "conversation.delta"
         ]
 
-        self.assertEqual("".join(deltas), "Repo: chatgpt2api done .")
+        self.assertEqual("".join(deltas), "Repo: chatgpt2api done.")
         self.assertFalse(any("\ue200" in delta or "\ue202" in delta or "\ue201" in delta for delta in deltas))
 
     def test_responses_tools_add_honest_no_tool_guard(self) -> None:
@@ -212,6 +236,100 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(model, "auto")
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("cannot execute local tools", str(messages[0]["content"]))
+
+    def test_chat_completions_accepts_remote_image_url(self) -> None:
+        class FakeImageResponse:
+            status_code = 200
+            headers = {"content-type": "image/png", "content-length": str(len(PNG_1X1))}
+            content = PNG_1X1
+
+        with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
+            model, messages = openai_v1_chat_complete.text_chat_parts({
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this"},
+                        {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                    ],
+                }],
+            })
+
+        request_get.assert_called_once()
+        self.assertEqual(model, "auto")
+        content = messages[0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "Describe this"})
+        self.assertEqual(content[1]["type"], "image")
+        self.assertEqual(content[1]["data"], PNG_1X1)
+        self.assertEqual(content[1]["mime"], "image/png")
+
+    def test_responses_text_request_preserves_input_image(self) -> None:
+        captured = {}
+
+        def fake_stream_text_deltas(_backend, request):
+            captured["messages"] = request.messages
+            yield "red"
+
+        body = {
+            "model": "auto",
+            "input": [
+                {"type": "input_text", "text": "What color is this image?"},
+                {"type": "input_image", "image_url": PNG_1X1_DATA_URL},
+            ],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            response = openai_v1_response.handle(body)
+
+        self.assertEqual(response["output"][0]["content"][0]["text"], "red")
+        content = captured["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "What color is this image?"})
+        self.assertEqual(content[1]["type"], "image")
+        self.assertEqual(content[1]["mime"], "image/png")
+        self.assertEqual(content[1]["data"], PNG_1X1)
+        self.assertGreater(response["usage"]["input_tokens_details"]["image_tokens"], 0)
+
+    def test_responses_text_request_accepts_remote_input_image_url(self) -> None:
+        class FakeImageResponse:
+            status_code = 200
+            headers = {"content-type": "image/png", "content-length": str(len(PNG_1X1))}
+            content = PNG_1X1
+
+        with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
+            _model, messages = openai_v1_response.text_response_parts({
+                "model": "auto",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this"},
+                        {"type": "input_image", "image_url": {"url": "https://example.test/image.png"}},
+                    ],
+                }],
+            })
+
+        request_get.assert_called_once()
+        content = messages[0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "Describe this"})
+        self.assertEqual(content[1]["type"], "image")
+        self.assertEqual(content[1]["data"], PNG_1X1)
+        self.assertEqual(content[1]["mime"], "image/png")
+
+    def test_image_extractor_supports_extra_image_object_shapes(self) -> None:
+        encoded = base64.b64encode(PNG_1X1).decode("ascii")
+
+        images = extract_image_from_message_content([
+            {"type": "image", "data": PNG_1X1, "mime": "image/png"},
+            {"type": "input_image", "base64": encoded, "mime_type": "image/png"},
+            {"type": "input_image", "source": {"type": "base64", "data": encoded, "media_type": "image/png"}},
+        ])
+
+        self.assertEqual(len(images), 3)
+        self.assertEqual([image[1] for image in images], ["image/png", "image/png", "image/png"])
+        self.assertTrue(all(image[0] == PNG_1X1 for image in images))
 
 
 if __name__ == "__main__":
