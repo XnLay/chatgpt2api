@@ -11,6 +11,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
+from services.openai_backend_api import InvalidAccessTokenError
 import services.register_service as register_service_module
 from services.register_service import RegisterService
 from services.storage.json_storage import JSONStorageBackend
@@ -131,6 +132,38 @@ class AccountCapabilityTests(unittest.TestCase):
                 else:
                     config.data["auto_remove_invalid_accounts"] = old_auto_remove
 
+    def test_confirm_invalid_refresh_removes_invalid_account_in_one_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-invalid"])
+            service.update_account(
+                "token-invalid",
+                {
+                    "status": "正常",
+                    "quota": 3,
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                },
+            )
+
+            def fake_fetch_remote_info(access_token: str, event: str = "fetch_remote_info") -> dict | None:
+                if service._record_invalid_token_seen(access_token, event, "HTTP 401"):
+                    service.remove_invalid_token(access_token, event)
+                raise InvalidAccessTokenError("HTTP 401")
+
+            service.fetch_remote_info = fake_fetch_remote_info
+            old_auto_remove = config.data.get("auto_remove_invalid_accounts")
+            config.data["auto_remove_invalid_accounts"] = True
+            try:
+                result = service.refresh_accounts(["token-invalid"], confirm_invalid=True)
+
+                self.assertEqual(result["errors"], [])
+                self.assertIsNone(service.get_account("token-invalid"))
+            finally:
+                if old_auto_remove is None:
+                    config.data.pop("auto_remove_invalid_accounts", None)
+                else:
+                    config.data["auto_remove_invalid_accounts"] = old_auto_remove
+
     def test_register_pool_metrics_ignore_pending_invalid_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -150,6 +183,13 @@ class AccountCapabilityTests(unittest.TestCase):
 
             original_account_service = register_service_module.account_service
             register_service_module.account_service = service
+            refresh_calls = []
+
+            def fake_refresh_accounts(tokens: list[str], **kwargs) -> dict:
+                refresh_calls.append((tokens, kwargs))
+                return {"refreshed": len(tokens), "errors": [], "items": service.list_accounts()}
+
+            service.refresh_accounts = fake_refresh_accounts
             try:
                 register_service = RegisterService(Path(tmp_dir) / "register.json")
                 metrics = register_service._pool_metrics()
@@ -157,6 +197,8 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertEqual(metrics["current_available"], 1)
                 self.assertEqual(metrics["current_quota"], 2)
                 self.assertFalse(register_service._target_reached({"mode": "available", "target_available": 2}, 0))
+                self.assertTrue(refresh_calls)
+                self.assertTrue(refresh_calls[0][1]["confirm_invalid"])
             finally:
                 register_service_module.account_service = original_account_service
 
@@ -172,6 +214,11 @@ class AccountCapabilityTests(unittest.TestCase):
 
             original_account_service = register_service_module.account_service
             register_service_module.account_service = service
+            service.refresh_accounts = lambda tokens, **kwargs: {
+                "refreshed": len(tokens),
+                "errors": [],
+                "items": service.list_accounts(),
+            }
             try:
                 register_service = RegisterService(Path(tmp_dir) / "register.json")
                 register_service.update(

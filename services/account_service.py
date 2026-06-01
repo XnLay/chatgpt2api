@@ -935,7 +935,30 @@ class AccountService:
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
-    def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
+    def _refresh_account_once(
+            self,
+            access_token: str,
+            event: str,
+            *,
+            confirm_invalid: bool = False,
+    ) -> tuple[dict[str, Any] | None, Exception | None]:
+        from services.openai_backend_api import InvalidAccessTokenError
+
+        # 显式刷新/后台巡检可在一次任务内完成异常确认，避免用户反复点击刷新按钮。
+        max_attempts = self._INVALID_CONFIRM_COUNT + 1 if confirm_invalid else 1
+        last_invalid_error: InvalidAccessTokenError | None = None
+        for _ in range(max_attempts):
+            try:
+                return self.fetch_remote_info(access_token, event), None
+            except InvalidAccessTokenError as exc:
+                last_invalid_error = exc
+                if not confirm_invalid:
+                    return None, exc
+                if self.get_account(access_token) is None:
+                    return None, None
+        return None, last_invalid_error
+
+    def refresh_accounts(self, access_tokens: list[str], *, confirm_invalid: bool = False) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
@@ -946,14 +969,22 @@ class AccountService:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts"): token
+                executor.submit(
+                    self._refresh_account_once,
+                    token,
+                    "refresh_accounts",
+                    confirm_invalid=confirm_invalid,
+                ): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
                 try:
-                    account = future.result()
+                    account, error = future.result()
                 except Exception as exc:
                     errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
+                    continue
+                if error is not None:
+                    errors.append({"token": anonymize_token(futures[future]), "error": str(error)})
                     continue
                 if account is not None:
                     refreshed += 1

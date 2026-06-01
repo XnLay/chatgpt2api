@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from threading import Event, Thread
 
@@ -79,27 +80,45 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
-def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
+def _account_refresh_interval_seconds() -> int:
+    return max(1, config.refresh_account_interval_minute) * 60
 
+
+def _wait_for_next_account_refresh(stop_event: Event, started_at: float) -> bool:
+    while not stop_event.is_set():
+        interval_seconds = _account_refresh_interval_seconds()
+        remaining = interval_seconds - (time.monotonic() - started_at)
+        if remaining <= 0:
+            return False
+        if stop_event.wait(min(5.0, remaining)):
+            return True
+    return True
+
+
+def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
+            started_at = time.monotonic()
             try:
+                all_tokens = account_service.list_tokens()
                 limited_tokens = account_service.list_limited_tokens()
                 invalid_tokens = account_service.list_invalid_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *invalid_tokens, *expiring_tokens]))
+                tokens = list(dict.fromkeys(all_tokens))
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
                     print(
                         "[account-watcher] checking "
+                        f"{len(tokens)} accounts, "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(invalid_tokens)} pending invalid accounts, "
                         f"{len(expiring_tokens)} expiring access tokens"
                     )
-                    account_service.refresh_accounts(tokens)
+                    result = account_service.refresh_accounts(tokens, confirm_invalid=True)
+                    if result.get("errors"):
+                        print(f"[account-watcher] refresh errors: {result['errors']}")
                 if keepalive_tokens:
                     print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)
@@ -107,7 +126,8 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
-            stop_event.wait(interval_seconds)
+            if _wait_for_next_account_refresh(stop_event, started_at):
+                break
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()

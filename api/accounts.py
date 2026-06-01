@@ -252,7 +252,7 @@ def create_router() -> APIRouter:
             access_tokens = account_service.list_tokens()
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.refresh_accounts(access_tokens)
+        return account_service.refresh_accounts(access_tokens, confirm_invalid=True)
 
     @router.post("/api/accounts/export")
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):

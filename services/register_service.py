@@ -48,6 +48,7 @@ class RegisterService:
         self._stop_event = threading.Event()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
+        self._last_pool_refresh_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -125,6 +126,28 @@ class RegisterService:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
 
+    def _refresh_pool_accounts(self, cfg: dict) -> None:
+        mode = str(cfg.get("mode") or "total")
+        if mode not in {"quota", "available"}:
+            return
+        try:
+            interval_seconds = max(1, int(cfg.get("check_interval") or 5))
+        except (TypeError, ValueError):
+            interval_seconds = 5
+        now = time.monotonic()
+        if self._last_pool_refresh_at and now - self._last_pool_refresh_at < interval_seconds:
+            return
+        self._last_pool_refresh_at = now
+        tokens = account_service.list_tokens()
+        if not tokens:
+            return
+        # 保号检查必须基于最新远端额度和异常状态，否则会误判“已达标”。
+        self._append_log(f"刷新号池账号信息：{len(tokens)} 个账号", "yellow")
+        result = account_service.refresh_accounts(tokens, confirm_invalid=True)
+        errors = result.get("errors") or []
+        if errors:
+            self._append_log(f"刷新号池账号信息部分失败：{len(errors)} 个账号", "yellow")
+
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
         # 目标可用账号必须与真实图片候选池一致；待确认异常账号不再参与保号统计。
@@ -141,6 +164,7 @@ class RegisterService:
 
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
+        self._refresh_pool_accounts(cfg)
         metrics = self._pool_metrics()
         self._bump(**metrics)
         if mode == "quota":
