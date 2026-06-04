@@ -112,6 +112,33 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         self.assertTrue(registrar.code_verifier)
         self.assertEqual(len(registrar.session.requests), 1)
 
+    def test_platform_authorize_cloudflare_challenge_log_is_concise(self):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = _FakeSession(
+            _FakeResponse(
+                status_code=403,
+                headers={"server": "cloudflare", "content-type": "text/html; charset=utf-8", "cf-mitigated": "challenge"},
+                text="<!DOCTYPE html><html><head><title>Create a password - OpenAI</title></head><body>challenge</body></html>",
+                url="https://auth.openai.com/create-account/password",
+            )
+        )
+        registrar.device_id = "device-id"
+        registrar.code_verifier = ""
+        registrar.platform_auth_code = ""
+        logs = []
+        old_sink = openai_register.register_log_sink
+        openai_register.register_log_sink = lambda text, color: logs.append((text, color))
+        try:
+            registrar._platform_authorize("user@example.com", 10)
+        finally:
+            openai_register.register_log_sink = old_sink
+
+        challenge_logs = [text for text, _color in logs if "Cloudflare challenge" in text]
+        self.assertEqual(challenge_logs, ["[任务10] platform authorize 返回 Cloudflare challenge，按 1.1.7 兼容策略继续尝试；"])
+        self.assertNotIn("<!DOCTYPE html>", challenge_logs[0])
+        self.assertNotIn("body=", challenge_logs[0])
+        self.assertNotIn("url=", challenge_logs[0])
+
 
 if __name__ == "__main__":
     unittest.main()

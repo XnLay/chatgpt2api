@@ -466,8 +466,8 @@ class PlatformRegistrar:
         if resp is None:
             raise RuntimeError(error or "platform_authorize_failed")
         if _is_cloudflare_challenge(resp):
-            debug = _response_debug_detail(resp)
-            step(index, f"platform authorize 返回 Cloudflare challenge，按 1.1.7 兼容策略继续尝试；{debug}", "yellow")
+            # Cloudflare 挑战页通常返回完整 HTML，实时日志只保留结论，避免刷屏。
+            step(index, "platform authorize 返回 Cloudflare challenge，按 1.1.7 兼容策略继续尝试；", "yellow")
         elif resp.status_code != 200:
             err = _response_json(resp).get("error", {})
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
