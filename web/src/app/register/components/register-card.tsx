@@ -80,7 +80,7 @@ export function RegisterCard() {
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册模式</label>
-              <Select value={config.mode || "total"} onValueChange={(value) => setMode(value as "total" | "quota" | "available")} disabled={config.enabled}>
+              <Select value={config.mode || "available"} onValueChange={(value) => setMode(value as "total" | "quota" | "available")} disabled={config.enabled}>
                 <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
                   <SelectValue />
                 </SelectTrigger>

@@ -14,6 +14,9 @@ from services.register import openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+DEFAULT_REGISTER_MODE = "available"
+DEFAULT_TARGET_AVAILABLE = 10
+DEFAULT_CHECK_INTERVAL = 600
 
 
 def _now() -> str:
@@ -21,7 +24,7 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**openai_register.config, "mode": DEFAULT_REGISTER_MODE, "target_quota": 100, "target_available": DEFAULT_TARGET_AVAILABLE, "check_interval": DEFAULT_CHECK_INTERVAL, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -29,10 +32,10 @@ def _normalize(raw: dict) -> dict:
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
-    cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
+    cfg["mode"] = str(cfg.get("mode") or DEFAULT_REGISTER_MODE).strip() if str(cfg.get("mode") or DEFAULT_REGISTER_MODE).strip() in {"total", "quota", "available"} else DEFAULT_REGISTER_MODE
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
-    cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
+    cfg["check_interval"] = max(1, int(cfg.get("check_interval") or DEFAULT_CHECK_INTERVAL))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     cfg["enabled"] = bool(cfg.get("enabled"))
     cfg = openai_register.apply_env_overrides(cfg)

@@ -772,7 +772,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         mode: registerConfig.mode,
         target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-        check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+        check_interval: Math.max(1, Number(registerConfig.check_interval) || 600),
       });
       set({ registerConfig: data.register });
       toast.success("注册配置已保存");
@@ -797,7 +797,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           mode: registerConfig.mode,
           target_quota: Math.max(1, Number(registerConfig.target_quota) || 1),
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
-          check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
+          check_interval: Math.max(1, Number(registerConfig.check_interval) || 600),
         });
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();

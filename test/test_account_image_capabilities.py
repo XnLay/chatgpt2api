@@ -225,6 +225,14 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertEqual(cfg["mail"]["providers"][0]["type"], "inbucket")
         self.assertEqual(cfg["mail"]["providers"][0]["domain"], ["env.example"])
 
+    def test_register_default_config_uses_available_pool_monitor(self) -> None:
+        with patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "test-auth"}, clear=True):
+            cfg = register_service_module._normalize({})
+
+        self.assertEqual(cfg["mode"], "available")
+        self.assertEqual(cfg["target_available"], 10)
+        self.assertEqual(cfg["check_interval"], 600)
+
     def test_register_stop_wakes_idle_available_monitor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))

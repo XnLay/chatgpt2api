@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "chatgpt2api-register-watchdog",
+  "main": "scripts/register_watchdog_worker.js",
+  "compatibility_date": "2026-06-06",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "vars": {
+    "CHATGPT2API_BASE_URL": "https://gptimage.canuco.de",
+    "WATCHDOG_TIMEOUT_MS": "15000"
+  }
+}
