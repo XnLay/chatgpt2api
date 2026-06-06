@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
@@ -201,6 +203,27 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertTrue(refresh_calls[0][1]["confirm_invalid"])
             finally:
                 register_service_module.account_service = original_account_service
+
+    def test_register_normalize_applies_env_mail_provider_overrides(self) -> None:
+        raw = {
+            "mail": {
+                "request_timeout": 30,
+                "wait_timeout": 30,
+                "wait_interval": 2,
+                "providers": [{"enable": True, "type": "cloudmail_gen"}],
+            }
+        }
+        env = {
+            "CHATGPT2API_AUTH_KEY": "test-auth",
+            "REGISTER_MAIL_PROVIDER": "inbucket",
+            "REGISTER_MAIL_PROVIDER_CONFIG": json.dumps({"api_base": "https://mail.example", "domain": "env.example"}),
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            cfg = register_service_module._normalize(raw)
+
+        self.assertEqual(cfg["mail"]["providers"][0]["type"], "inbucket")
+        self.assertEqual(cfg["mail"]["providers"][0]["domain"], ["env.example"])
 
     def test_register_stop_wakes_idle_available_monitor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

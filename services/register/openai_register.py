@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import random
 import secrets
 import string
@@ -25,6 +26,153 @@ from services.register import mail_provider
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+MAIL_ENV_SETTING_KEYS = ("request_timeout", "wait_timeout", "wait_interval", "user_agent", "proxy")
+
+
+def _env_value(*names: str) -> tuple[str, str]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return name, value.strip()
+    return "", ""
+
+
+def _env_json(*names: str) -> tuple[str, Any | None]:
+    name, raw = _env_value(*names)
+    if not raw:
+        return "", None
+    try:
+        return name, json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"环境变量 {name} 必须是合法 JSON: {error.msg}") from error
+
+
+def _env_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise ValueError(f"环境变量 {name} 必须是数字") from error
+
+
+def _env_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.replace("\n", ",").split(",") if item.strip()]
+
+
+def _normalize_env_provider(entry: Any, source: str) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError(f"{source} 中的邮箱 provider 必须是 JSON 对象")
+    provider = dict(entry)
+    provider_type = str(provider.get("type") or "").strip()
+    if not provider_type:
+        raise ValueError(f"{source} 中的邮箱 provider 缺少 type")
+    provider["type"] = provider_type
+    provider["enable"] = _env_bool(provider.get("enable"), True)
+    for key in ("domain", "cf_domain"):
+        if key in provider:
+            provider[key] = _env_string_list(provider.get(key))
+    if provider_type == "cloudmail_gen" and "subdomain" in provider:
+        provider["subdomain"] = _env_string_list(provider.get("subdomain"))
+    return provider
+
+
+def _merge_env_mail_object(overrides: dict, value: Any, source: str, allow_single_provider: bool = False) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"环境变量 {source} 必须是 JSON 对象")
+    for key in MAIL_ENV_SETTING_KEYS:
+        if key in value:
+            overrides[key] = value[key]
+    providers = value.get("providers")
+    if isinstance(providers, list):
+        overrides["providers"] = [_normalize_env_provider(item, source) for item in providers]
+    elif providers is not None:
+        raise ValueError(f"环境变量 {source}.providers 必须是 JSON 数组")
+    elif allow_single_provider and "type" in value:
+        overrides["providers"] = [_normalize_env_provider(value, source)]
+
+
+def _merge_env_provider_overrides(overrides: dict) -> None:
+    name, value = _env_json("REGISTER_MAIL_PROVIDERS", "REGISTER_MAIL_PROVIDERS_JSON")
+    if value is None:
+        config_name, provider_config = _env_json("REGISTER_MAIL_PROVIDER_CONFIG", "REGISTER_MAIL_PROVIDER_JSON")
+        provider_config = provider_config or {}
+        if not isinstance(provider_config, dict):
+            raise ValueError(f"环境变量 {config_name} 必须是 JSON 对象")
+        provider_type = os.getenv("REGISTER_MAIL_PROVIDER") or provider_config.get("type") or ""
+        provider_type = str(provider_type).strip()
+        if provider_type:
+            overrides["providers"] = [_normalize_env_provider({**provider_config, "type": provider_type}, "REGISTER_MAIL_PROVIDER_CONFIG")]
+        return
+    if isinstance(value, list):
+        overrides["providers"] = [_normalize_env_provider(item, name) for item in value]
+        return
+    if isinstance(value, dict):
+        provider_overrides: dict[str, Any] = {}
+        _merge_env_mail_object(provider_overrides, value, name, allow_single_provider=True)
+        if "providers" in provider_overrides:
+            overrides.update(provider_overrides)
+            return
+    raise ValueError(f"环境变量 {name} 必须是 provider 对象、provider 数组，或包含 providers 数组的对象")
+
+
+def _env_mail_overrides() -> dict:
+    overrides: dict[str, Any] = {}
+
+    _, mail_object = _env_json("REGISTER_MAIL", "REGISTER_MAIL_JSON")
+    if mail_object is not None:
+        _merge_env_mail_object(overrides, mail_object, "REGISTER_MAIL")
+
+    _merge_env_provider_overrides(overrides)
+
+    env_field_map = {
+        "REGISTER_MAIL_REQUEST_TIMEOUT": "request_timeout",
+        "REGISTER_MAIL_WAIT_TIMEOUT": "wait_timeout",
+        "REGISTER_MAIL_WAIT_INTERVAL": "wait_interval",
+    }
+    for env_name, key in env_field_map.items():
+        value = _env_float(env_name)
+        if value is not None:
+            overrides[key] = value
+
+    _, user_agent = _env_value("REGISTER_MAIL_USER_AGENT")
+    if user_agent:
+        overrides["user_agent"] = user_agent
+    _, proxy = _env_value("REGISTER_MAIL_PROXY")
+    if proxy:
+        overrides["proxy"] = proxy
+    return overrides
+
+
+def apply_env_overrides(source: dict) -> dict:
+    """应用注册机环境变量覆盖；环境变量优先级高于持久化配置。"""
+    cfg = json.loads(json.dumps(source, ensure_ascii=False))
+    overrides = _env_mail_overrides()
+    if not overrides:
+        return cfg
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    cfg["mail"] = {**mail, **overrides}
+    return cfg
+
+
 base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
@@ -43,6 +191,7 @@ try:
     config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
 except Exception:
     pass
+config = apply_env_overrides(config)
 
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"

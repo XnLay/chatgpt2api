@@ -93,6 +93,32 @@ environment:
   - DATABASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
+### 注册机邮箱提供商环境变量
+
+注册机支持用环境变量覆盖 `data/register.json` 中的邮箱提供商配置，适合 Docker/Render 等只想通过环境变量注入密钥的部署方式。
+
+- `REGISTER_MAIL_PROVIDER`：单个邮箱提供商类型，例如 `tempmail_lol`、`inbucket`、`cloudmail_gen`
+- `REGISTER_MAIL_PROVIDER_CONFIG`：单 provider 的 JSON 配置，不需要重复写 `type`
+- `REGISTER_MAIL_PROVIDERS`：多个 provider 的 JSON 数组，或包含 `providers` 数组的完整 mail JSON 对象
+- `REGISTER_MAIL`：完整 mail JSON 对象，可配置 `request_timeout`、`wait_timeout`、`wait_interval`、`providers`
+- `REGISTER_MAIL_REQUEST_TIMEOUT` / `REGISTER_MAIL_WAIT_TIMEOUT` / `REGISTER_MAIL_WAIT_INTERVAL`：覆盖邮箱请求与等待超时
+
+示例：配置单个 `tempmail_lol` provider
+
+```yaml
+environment:
+  - REGISTER_MAIL_PROVIDER=tempmail_lol
+  - REGISTER_MAIL_PROVIDER_CONFIG={"api_key":"your_api_key","domain":["example.com"]}
+  - REGISTER_MAIL_WAIT_TIMEOUT=60
+```
+
+示例：配置多个 provider
+
+```yaml
+environment:
+  - REGISTER_MAIL_PROVIDERS=[{"enable":true,"type":"inbucket","api_base":"https://mail.example.com","domain":["example.com"]},{"enable":true,"type":"tempmail_lol","api_key":"your_api_key","domain":["example.org"]}]
+```
+
 ## 功能
 
 ### API 兼容能力

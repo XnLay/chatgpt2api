@@ -35,6 +35,7 @@ def _normalize(raw: dict) -> dict:
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     cfg["enabled"] = bool(cfg.get("enabled"))
+    cfg = openai_register.apply_env_overrides(cfg)
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
     cfg["stats"] = stats

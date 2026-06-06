@@ -1,4 +1,7 @@
+import json
+import os
 import unittest
+from unittest.mock import patch
 
 import requests
 
@@ -138,6 +141,77 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         self.assertNotIn("<!DOCTYPE html>", challenge_logs[0])
         self.assertNotIn("body=", challenge_logs[0])
         self.assertNotIn("url=", challenge_logs[0])
+
+
+class OpenAIRegisterEnvConfigTests(unittest.TestCase):
+    def test_apply_env_mail_provider_uses_single_provider_config(self):
+        base = {
+            "mail": {
+                "request_timeout": 30,
+                "wait_timeout": 30,
+                "wait_interval": 2,
+                "providers": [{"enable": True, "type": "cloudmail_gen"}],
+            }
+        }
+        env = {
+            "REGISTER_MAIL_PROVIDER": "tempmail_lol",
+            "REGISTER_MAIL_PROVIDER_CONFIG": json.dumps({"api_key": "secret", "domain": "a.example,b.example"}),
+            "REGISTER_MAIL_WAIT_TIMEOUT": "45",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            cfg = openai_register.apply_env_overrides(base)
+
+        self.assertEqual(base["mail"]["providers"][0]["type"], "cloudmail_gen")
+        self.assertEqual(cfg["mail"]["wait_timeout"], 45.0)
+        self.assertEqual(
+            cfg["mail"]["providers"],
+            [{"api_key": "secret", "domain": ["a.example", "b.example"], "type": "tempmail_lol", "enable": True}],
+        )
+
+    def test_apply_env_mail_accepts_mail_json_object(self):
+        base = {"mail": {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "providers": []}}
+        env = {
+            "REGISTER_MAIL": json.dumps(
+                {
+                    "request_timeout": 12,
+                    "providers": [
+                        {"type": "inbucket", "api_base": "https://mail.example", "domain": "example.com"},
+                    ],
+                }
+            )
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            cfg = openai_register.apply_env_overrides(base)
+
+        self.assertEqual(cfg["mail"]["request_timeout"], 12)
+        self.assertEqual(
+            cfg["mail"]["providers"],
+            [{"type": "inbucket", "api_base": "https://mail.example", "domain": ["example.com"], "enable": True}],
+        )
+
+    def test_apply_env_mail_providers_accepts_full_mail_object(self):
+        base = {"mail": {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "providers": []}}
+        env = {
+            "REGISTER_MAIL_PROVIDERS": json.dumps(
+                {
+                    "request_timeout": 20,
+                    "providers": [{"type": "inbucket", "api_base": "https://mail.example", "domain": ["example.com"]}],
+                }
+            )
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            cfg = openai_register.apply_env_overrides(base)
+
+        self.assertEqual(cfg["mail"]["request_timeout"], 20)
+        self.assertEqual(cfg["mail"]["providers"][0]["type"], "inbucket")
+
+    def test_apply_env_mail_provider_rejects_invalid_json(self):
+        with patch.dict(os.environ, {"REGISTER_MAIL_PROVIDER_CONFIG": "not-json", "REGISTER_MAIL_PROVIDER": "tempmail_lol"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "REGISTER_MAIL_PROVIDER_CONFIG"):
+                openai_register.apply_env_overrides({"mail": {"providers": []}})
 
 
 if __name__ == "__main__":
