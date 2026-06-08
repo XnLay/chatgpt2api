@@ -255,7 +255,7 @@ curl http://localhost:8000/v1/images/edits \
 <summary><code>POST /v1/chat/completions</code></summary>
 <br>
 
-面向图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
+面向文本、网页搜索与图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -279,10 +279,12 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 字段         | 说明                |
 |:-----------|:------------------|
-| `model`    | 图片模型，默认按图片生成场景处理  |
-| `messages` | 消息数组，需要是图片相关请求内容  |
-| `n`        | 生成数量，按当前实现解析为图片数量 |
-| `stream`   | 已实现，但仍在测试         |
+| `model`    | 文本、搜索或图片模型；搜索模型会触发网页搜索兼容逻辑 |
+| `messages` | 消息数组，支持文本、搜索和图片请求内容 |
+| `n`        | 图片生成数量，按当前实现解析为图片数量 |
+| `stream`   | 文本、搜索和图片场景均支持，仍在测试 |
+| `tools`    | 文本场景支持 `web_search` / `web_search_preview` / `web_search_preview_2025_03_11` |
+| `web_search_options` | 传入时会触发网页搜索兼容逻辑 |
 
 <br>
 </details>
@@ -292,7 +294,7 @@ curl http://localhost:8000/v1/chat/completions \
 <summary><code>POST /v1/responses</code></summary>
 <br>
 
-面向图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
+面向文本、网页搜索和图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
 
 ```bash
 curl http://localhost:8000/v1/responses \
@@ -315,9 +317,9 @@ curl http://localhost:8000/v1/responses \
 
 | 字段       | 说明                            |
 |:---------|:------------------------------|
-| `model`  | 响应中会回显该模型字段，但图片生成当前仍走图片生成兼容逻辑 |
-| `input`  | 输入内容，需要能解析出图片生成提示词            |
-| `tools`  | 必须包含 `image_generation` 工具请求  |
+| `model`  | 响应中会回显该模型字段，搜索和图片生成会走对应兼容逻辑 |
+| `input`  | 输入内容；搜索使用最后一条用户文本，图片生成需能解析出提示词 |
+| `tools`  | 支持 `image_generation`、`web_search`、`web_search_preview`、`web_search_preview_2025_03_11` |
 | `stream` | 已实现，但仍在测试                     |
 
 <br>
