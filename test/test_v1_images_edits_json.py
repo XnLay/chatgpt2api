@@ -11,12 +11,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
-import api.image_inputs as image_inputs_module
 from services.config import config
 
-AUTH_HEADERS = {"Authorization": f"Bearer {config.auth_key}"}
 PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(b"fake-png").decode("ascii")
 JPEG_DATA_URL = "data:image/jpeg;base64," + base64.b64encode(b"fake-jpeg").decode("ascii")
+
+
+def auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {config.auth_key}"}
 
 
 class ImageEditsJsonApiTests(unittest.TestCase):
@@ -39,14 +41,14 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_json_model_omitted_uses_existing_default_logic(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "未传 model", "image": PNG_DATA_URL})
+        response = self.client.post("/v1/images/edits", headers=auth_headers(), json={"prompt": "未传 model", "image": PNG_DATA_URL})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.calls[0]["model"], "gpt-image-2")
 
     def test_json_model_is_not_overwritten_when_provided(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=auth_headers(),
             json={"model": "codex-gpt-image-2", "prompt": "保留 model", "image": PNG_DATA_URL},
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -55,7 +57,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_accepts_json_image_url(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=auth_headers(),
             json={
                 "model": "gpt-image-2",
                 "prompt": "把图片改成夜景风格",
@@ -73,7 +75,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_accepts_json_multiple_images_and_b64_json(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=auth_headers(),
             json={
                 "prompt": "把两张图合成海报",
                 "images": [
@@ -93,7 +95,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_keeps_original_multipart_multiple_image_logic(self):
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=auth_headers(),
             data={"prompt": "multipart 多图仍然可用", "model": "gpt-image-2", "n": "1"},
             files=[
                 ("image", ("one.png", b"one", "image/png")),
@@ -109,28 +111,29 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         ])
 
     def test_image_edit_rejects_json_without_image(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "缺少图片"})
+        response = self.client.post("/v1/images/edits", headers=auth_headers(), json={"prompt": "缺少图片"})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("image file or image_url is required", response.text)
 
     def test_image_edit_accepts_remote_json_url(self):
-        remote_response = mock.Mock(
-            status_code=200,
-            headers={"content-type": "image/png", "content-length": "10"},
-            content=b"remote-png",
-        )
-        with mock.patch.object(image_inputs_module.requests, "get", return_value=remote_response) as fake_get:
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "image/png", "content-length": str(len(b"remote-png"))}
+            content = b"remote-png"
+
+        with mock.patch("api.image_inputs.requests.get", return_value=FakeResponse()) as get:
             response = self.client.post(
                 "/v1/images/edits",
-                headers=AUTH_HEADERS,
-                json={"prompt": "支持远程拉图", "images": [{"image_url": "https://example.com/a.png"}]},
+                headers=auth_headers(),
+                json={"prompt": "允许远程拉图", "images": [{"image_url": "https://example.com/a.png"}]},
             )
+
         self.assertEqual(response.status_code, 200, response.text)
-        fake_get.assert_called_once()
         self.assertEqual(self.calls[0]["images"], [(b"remote-png", "a.png", "image/png")])
+        get.assert_called_once()
 
     def test_image_edit_rejects_json_n_out_of_range(self):
-        response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "n 越界", "n": 5, "image": PNG_DATA_URL})
+        response = self.client.post("/v1/images/edits", headers=auth_headers(), json={"prompt": "n 越界", "n": 5, "image": PNG_DATA_URL})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertFalse(self.calls)
 
