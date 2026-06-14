@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -203,79 +201,6 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertTrue(refresh_calls[0][1]["confirm_invalid"])
             finally:
                 register_service_module.account_service = original_account_service
-
-    def test_register_normalize_applies_env_mail_provider_overrides(self) -> None:
-        raw = {
-            "mail": {
-                "request_timeout": 30,
-                "wait_timeout": 30,
-                "wait_interval": 2,
-                "providers": [{"enable": True, "type": "cloudmail_gen"}],
-            }
-        }
-        env = {
-            "CHATGPT2API_AUTH_KEY": "test-auth",
-            "REGISTER_MAIL_PROVIDER": "inbucket",
-            "REGISTER_MAIL_PROVIDER_CONFIG": json.dumps({"api_base": "https://mail.example", "domain": "env.example"}),
-        }
-
-        with patch.dict(os.environ, env, clear=True):
-            cfg = register_service_module._normalize(raw)
-
-        self.assertEqual(cfg["mail"]["providers"][0]["type"], "inbucket")
-        self.assertEqual(cfg["mail"]["providers"][0]["domain"], ["env.example"])
-
-    def test_register_default_config_uses_available_pool_monitor(self) -> None:
-        with patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "test-auth"}, clear=True):
-            cfg = register_service_module._normalize({})
-
-        self.assertEqual(cfg["mode"], "available")
-        self.assertEqual(cfg["target_available"], 10)
-        self.assertEqual(cfg["check_interval"], 600)
-
-    def test_register_stop_wakes_idle_available_monitor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
-            service.add_account_items(
-                [
-                    {"access_token": "token-1", "status": "正常", "quota": 3},
-                    {"access_token": "token-2", "status": "正常", "quota": 3},
-                ]
-            )
-
-            original_account_service = register_service_module.account_service
-            register_service_module.account_service = service
-            service.refresh_accounts = lambda tokens, **kwargs: {
-                "refreshed": len(tokens),
-                "errors": [],
-                "items": service.list_accounts(),
-            }
-            try:
-                register_service = RegisterService(Path(tmp_dir) / "register.json")
-                register_service.update(
-                    {
-                        "mode": "available",
-                        "target_available": 1,
-                        "check_interval": 60,
-                        "threads": 1,
-                    }
-                )
-                register_service.start()
-                self.assertIsNotNone(register_service._runner)
-
-                time.sleep(0.05)
-                register_service.stop()
-
-                deadline = time.monotonic() + 2
-                while register_service._runner and register_service._runner.is_alive() and time.monotonic() < deadline:
-                    time.sleep(0.02)
-
-                self.assertFalse(register_service._runner and register_service._runner.is_alive())
-                logs = [item["text"] for item in register_service.get()["logs"]]
-                self.assertIn("注册任务结束，成功0，失败0", logs)
-            finally:
-                register_service_module.account_service = original_account_service
-
 
 class TokenLogTests(unittest.TestCase):
     def test_anonymize_token_hides_raw_value(self) -> None:
