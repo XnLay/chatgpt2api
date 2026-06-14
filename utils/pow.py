@@ -14,8 +14,7 @@ from utils.helper import new_uuid
 
 
 CORES = [8, 16, 24, 32]
-DOCUMENT_KEYS = ["__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"]
-SCREEN_RESOLUTIONS = [[1920, 1080], [1440, 900], [2560, 1440], [3840, 2160]]
+DOCUMENT_KEYS = ["_reactListeningo743lnnpvdg", "location"]
 
 
 class ScriptSrcParser(HTMLParser):
@@ -142,16 +141,16 @@ def build_pow_config(
     ])
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
     return [
-        sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
+        random.choice([3000, 4000, 5000]),
         _legacy_parse_time(),
         4294705152,
-        1,
+        0,
         user_agent,
         script_source,
         data_build,
         "en-US",
         "en-US,es-US,en,es",
-        random.random(),
+        0,
         navigator_key,
         random.choice(DOCUMENT_KEYS),
         window_key,
@@ -160,8 +159,6 @@ def build_pow_config(
         "",
         random.choice(CORES),
         time.time() * 1000 - (time.perf_counter() * 1000),
-        0, 0, 0, 0, 0, 0,
-        0,  # 0 = edge/chrome, 1 = firefox
     ]
 
 
@@ -187,10 +184,10 @@ def build_legacy_requirements_token(
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
 ) -> str:
+    seed = format(random.random())
     config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
-    return "gAAAAAC" + pybase64.b64encode(
-        json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
-    ).decode()
+    answer, _ = _pow_generate(seed, "0fffff", config)
+    return "gAAAAAC" + answer
 
 
 def build_proof_token(

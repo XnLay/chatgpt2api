@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import random
 import secrets
 import string
@@ -14,11 +15,163 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from curl_cffi import requests
+import requests
+import urllib3
+from curl_cffi import requests as curl_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from services.account_service import account_service
-from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+MAIL_ENV_SETTING_KEYS = ("request_timeout", "wait_timeout", "wait_interval", "user_agent", "proxy")
+
+
+def _env_value(*names: str) -> tuple[str, str]:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return name, value.strip()
+    return "", ""
+
+
+def _env_json(*names: str) -> tuple[str, Any | None]:
+    name, raw = _env_value(*names)
+    if not raw:
+        return "", None
+    try:
+        return name, json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"环境变量 {name} 必须是合法 JSON: {error.msg}") from error
+
+
+def _env_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise ValueError(f"环境变量 {name} 必须是数字") from error
+
+
+def _env_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.replace("\n", ",").split(",") if item.strip()]
+
+
+def _normalize_env_provider(entry: Any, source: str) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError(f"{source} 中的邮箱 provider 必须是 JSON 对象")
+    provider = dict(entry)
+    provider_type = str(provider.get("type") or "").strip()
+    if not provider_type:
+        raise ValueError(f"{source} 中的邮箱 provider 缺少 type")
+    provider["type"] = provider_type
+    provider["enable"] = _env_bool(provider.get("enable"), True)
+    for key in ("domain", "cf_domain"):
+        if key in provider:
+            provider[key] = _env_string_list(provider.get(key))
+    if provider_type == "cloudmail_gen" and "subdomain" in provider:
+        provider["subdomain"] = _env_string_list(provider.get("subdomain"))
+    return provider
+
+
+def _merge_env_mail_object(overrides: dict, value: Any, source: str, allow_single_provider: bool = False) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"环境变量 {source} 必须是 JSON 对象")
+    for key in MAIL_ENV_SETTING_KEYS:
+        if key in value:
+            overrides[key] = value[key]
+    providers = value.get("providers")
+    if isinstance(providers, list):
+        overrides["providers"] = [_normalize_env_provider(item, source) for item in providers]
+    elif providers is not None:
+        raise ValueError(f"环境变量 {source}.providers 必须是 JSON 数组")
+    elif allow_single_provider and "type" in value:
+        overrides["providers"] = [_normalize_env_provider(value, source)]
+
+
+def _merge_env_provider_overrides(overrides: dict) -> None:
+    name, value = _env_json("REGISTER_MAIL_PROVIDERS", "REGISTER_MAIL_PROVIDERS_JSON")
+    if value is None:
+        config_name, provider_config = _env_json("REGISTER_MAIL_PROVIDER_CONFIG", "REGISTER_MAIL_PROVIDER_JSON")
+        provider_config = provider_config or {}
+        if not isinstance(provider_config, dict):
+            raise ValueError(f"环境变量 {config_name} 必须是 JSON 对象")
+        provider_type = os.getenv("REGISTER_MAIL_PROVIDER") or provider_config.get("type") or ""
+        provider_type = str(provider_type).strip()
+        if provider_type:
+            overrides["providers"] = [_normalize_env_provider({**provider_config, "type": provider_type}, "REGISTER_MAIL_PROVIDER_CONFIG")]
+        return
+    if isinstance(value, list):
+        overrides["providers"] = [_normalize_env_provider(item, name) for item in value]
+        return
+    if isinstance(value, dict):
+        provider_overrides: dict[str, Any] = {}
+        _merge_env_mail_object(provider_overrides, value, name, allow_single_provider=True)
+        if "providers" in provider_overrides:
+            overrides.update(provider_overrides)
+            return
+    raise ValueError(f"环境变量 {name} 必须是 provider 对象、provider 数组，或包含 providers 数组的对象")
+
+
+def _env_mail_overrides() -> dict:
+    overrides: dict[str, Any] = {}
+
+    _, mail_object = _env_json("REGISTER_MAIL", "REGISTER_MAIL_JSON")
+    if mail_object is not None:
+        _merge_env_mail_object(overrides, mail_object, "REGISTER_MAIL")
+
+    _merge_env_provider_overrides(overrides)
+
+    env_field_map = {
+        "REGISTER_MAIL_REQUEST_TIMEOUT": "request_timeout",
+        "REGISTER_MAIL_WAIT_TIMEOUT": "wait_timeout",
+        "REGISTER_MAIL_WAIT_INTERVAL": "wait_interval",
+    }
+    for env_name, key in env_field_map.items():
+        value = _env_float(env_name)
+        if value is not None:
+            overrides[key] = value
+
+    _, user_agent = _env_value("REGISTER_MAIL_USER_AGENT")
+    if user_agent:
+        overrides["user_agent"] = user_agent
+    _, proxy = _env_value("REGISTER_MAIL_PROXY")
+    if proxy:
+        overrides["proxy"] = proxy
+    return overrides
+
+
+def apply_env_overrides(source: dict) -> dict:
+    """应用注册机环境变量覆盖；环境变量优先级高于持久化配置。"""
+    cfg = json.loads(json.dumps(source, ensure_ascii=False))
+    overrides = _env_mail_overrides()
+    if not overrides:
+        return cfg
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    cfg["mail"] = {**mail, **overrides}
+    return cfg
+
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -38,6 +191,7 @@ try:
     config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
 except Exception:
     pass
+config = apply_env_overrides(config)
 
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"
@@ -60,15 +214,11 @@ register_log_sink = None
 
 common_headers = {
     "accept": "application/json",
-    "accept-encoding": "gzip, deflate, br",
     "accept-language": "en-US,en;q=0.9",
-    "cache-control": "no-cache",
-    "connection": "keep-alive",
     "content-type": "application/json",
-    "dnt": "1",
     "origin": auth_base,
     "priority": "u=1, i",
-    "sec-gpc": "1",
+    "user-agent": user_agent,
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
@@ -80,17 +230,12 @@ common_headers = {
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
-    "user-agent": user_agent,
 }
 
 navigate_headers = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-encoding": "gzip, deflate, br",
     "accept-language": "en-US,en;q=0.9",
-    "cache-control": "max-age=0",
-    "connection": "keep-alive",
-    "dnt": "1",
-    "sec-gpc": "1",
+    "user-agent": user_agent,
     "sec-ch-ua": sec_ch_ua,
     "sec-ch-ua-arch": '"x86_64"',
     "sec-ch-ua-bitness": '"64"',
@@ -104,7 +249,6 @@ navigate_headers = {
     "sec-fetch-site": "same-origin",
     "sec-fetch-user": "?1",
     "upgrade-insecure-requests": "1",
-    "user-agent": user_agent,
 }
 
 
@@ -138,7 +282,10 @@ def _make_trace_headers() -> dict[str, str]:
     }
 
 
-from utils.pkce import generate_pkce as _generate_pkce  # noqa: F401
+def _generate_pkce() -> tuple[str, str]:
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    return code_verifier, code_challenge
 
 
 def _random_password(length: int = 16) -> str:
@@ -194,112 +341,153 @@ def _response_debug_detail(resp, limit: int = 800) -> str:
 def _is_cloudflare_challenge(resp) -> bool:
     if resp is None:
         return False
-    try:
-        status_code = int(getattr(resp, "status_code", 0) or 0)
-    except (TypeError, ValueError):
-        status_code = 0
-    if status_code not in (403, 503):
-        return False
     text = str(getattr(resp, "text", "") or "").lower()
-    return (
-        "<title>just a moment" in text
-        or "<title>attention required! | cloudflare" in text
-        or "cf-chl-" in text
-        or "__cf_chl_" in text
-        or "cf-browser-verification" in text
+    headers = getattr(resp, "headers", {}) or {}
+    content_type = str(headers.get("content-type") or "").lower()
+    cf_mitigated = str(headers.get("cf-mitigated") or "").lower()
+    server = str(headers.get("server") or "").lower()
+    if cf_mitigated == "challenge":
+        return True
+    challenge_markers = (
+        "challenges.cloudflare.com",
+        "/cdn-cgi/challenge-platform",
+        "cf-chl-",
+        "cf_chl_",
+        "cf-browser-verification",
+        "<title>just a moment",
+        "attention required! | cloudflare",
+        "enable cookies",
     )
-
-
-def _mail_config() -> dict:
-    return {**config["mail"], "proxy": config["proxy"]}
-
-
-def _authorize_landed_page(resp) -> str:
-    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
-
-    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
-    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
-    """
-    if resp is None:
-        return ""
-    final_url = str(getattr(resp, "url", "") or "").lower()
-    data = _response_json(resp)
-    page_type = ""
-    page = data.get("page") if isinstance(data, dict) else None
-    if isinstance(page, dict):
-        page_type = str(page.get("type") or "").lower()
-    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
-        return "signup"
-    if "/log-in" in final_url or "/login" in final_url or page_type in {"login", "password_verification"}:
-        return "login"
-    return ""
+    if any(marker in text for marker in challenge_markers):
+        return True
+    # Cloudflare 也常作为正常 API 网关，单独的 `server: cloudflare`
+    # 不能视为拦截；只有返回 HTML 挑战页特征时才判定为 Cloudflare challenge。
+    return "cloudflare" in server and "text/html" in content_type and "challenge" in text
 
 
 def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(_mail_config(), username)
+    return mail_provider.create_mailbox(config["mail"], username)
 
 
 def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(_mail_config(), mailbox)
+    return mail_provider.wait_for_code(config["mail"], mailbox)
 
 
-from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
+class SentinelTokenGenerator:
+    MAX_ATTEMPTS = 500000
+    ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
+
+    def __init__(self, device_id: str, ua: str):
+        self.device_id = device_id
+        self.user_agent = ua
+        self.sid = str(uuid.uuid4())
+
+    @staticmethod
+    def _fnv1a_32(text: str) -> str:
+        h = 2166136261
+        for ch in text:
+            h ^= ord(ch)
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 2246822507) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 3266489909) & 0xFFFFFFFF
+        h ^= h >> 16
+        return format(h & 0xFFFFFFFF, "08x")
+
+    def _get_config(self) -> list:
+        perf_now = random.uniform(1000, 50000)
+        return [
+            "1920x1080",
+            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            4294705152,
+            random.random(),
+            self.user_agent,
+            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            None,
+            None,
+            "en-US",
+            random.random(),
+            random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
+            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
+            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
+            perf_now,
+            self.sid,
+            "",
+            random.choice([4, 8, 12, 16]),
+            time.time() * 1000 - perf_now,
+        ]
+
+    @staticmethod
+    def _b64(data) -> str:
+        return base64.b64encode(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).decode("ascii")
+
+    def generate_requirements_token(self) -> str:
+        data = self._get_config()
+        data[3] = 1
+        data[9] = round(random.uniform(5, 50))
+        return "gAAAAAC" + self._b64(data)
+
+    def generate_token(self, seed: str, difficulty: str) -> str:
+        start = time.time()
+        data = self._get_config()
+        difficulty = str(difficulty or "0")
+        for i in range(self.MAX_ATTEMPTS):
+            data[3] = i
+            data[9] = round((time.time() - start) * 1000)
+            payload = self._b64(data)
+            if self._fnv1a_32(seed + payload)[: len(difficulty)] <= difficulty:
+                return "gAAAAAB" + payload + "~S"
+        return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
-    return sentinel_val
+    generator = SentinelTokenGenerator(device_id, user_agent)
+    resp = session.post(
+        "https://sentinel.openai.com/backend-api/sentinel/req",
+        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        headers={
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+            "Origin": "https://sentinel.openai.com",
+            "User-Agent": user_agent,
+            "sec-ch-ua": sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+        timeout=20,
+        verify=False,
+    )
+    data = _response_json(resp)
+    token = str(data.get("token") or "").strip()
+    if resp.status_code != 200 or not token:
+        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+    pow_data = data.get("proofofwork") or {}
+    p_value = (
+        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
+        if pow_data.get("required") and pow_data.get("seed")
+        else generator.generate_requirements_token()
+    )
+    return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+
+
+def _is_socks_proxy(proxy: str) -> bool:
+    candidate = str(proxy or "").strip().lower()
+    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
 
 
 def create_session(proxy: str = "") -> Any:
-    kwargs = proxy_settings.build_session_kwargs(
-        proxy=proxy,
-        upstream=True,
-        impersonate="chrome",
-        verify=False,
-    )
-    return requests.Session(**kwargs)
-
-
-def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBundle | None) -> None:
-    if bundle is None:
-        return
-    if bundle.user_agent:
-        session.headers["User-Agent"] = bundle.user_agent
-        session.headers["user-agent"] = bundle.user_agent
-    for name, value in bundle.cookies.items():
-        try:
-            session.cookies.set(name, value, domain=f".{bundle.target_host or 'openai.com'}")
-            session.cookies.set(name, value, domain=bundle.target_host or "auth.openai.com")
-        except Exception:
-            continue
-
-
-def _headers_with_clearance(
-    headers: dict[str, str],
-    target_url: str,
-    proxy: str = "",
-    user_agent_override: str = "",
-) -> dict[str, str]:
-    merged = proxy_settings.build_headers(
-        headers=headers,
-        target_url=target_url,
-        proxy=proxy,
-        upstream=True,
-    )
-    normalized = {str(key): str(value) for key, value in merged.items()}
-    if user_agent_override:
-        ua_key = next((key for key in normalized if key.lower() == "user-agent"), "user-agent")
-        normalized[ua_key] = user_agent_override
-    return normalized
-
-
-def _cloudflare_block_message(resp, prefix: str = "被 Cloudflare 拦截", reason: str = "") -> str:
-    status = getattr(resp, "status_code", "unknown")
-    debug = _response_debug_detail(resp)
-    reason = reason or "clearance 刷新失败或重试后仍失败，请更换 IP/代理重试"
-    return f"{prefix}，{reason}: status={status}, {debug}"
+    if _is_socks_proxy(proxy):
+        return curl_requests.Session(impersonate="chrome", verify=False, proxy=proxy)
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = False
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
@@ -379,10 +567,7 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
-        self.proxy = str(proxy or "").strip()
-        self.session = create_session(self.proxy)
-        self.clearance_user_agent = ""
-        self.clearance_failure_reason = ""
+        self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
@@ -403,31 +588,6 @@ class PlatformRegistrar:
         headers.update(_make_trace_headers())
         return headers
 
-    def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
-        self.clearance_failure_reason = ""
-        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
-        if not profile.clearance_enabled:
-            self.clearance_failure_reason = (
-                "可尝试使用 FlareSolverr 清障方式，注意需要 Docker 部署 flaresolverr、privoxy、warp-proxy 等相关容器"
-            )
-            step(index, f"检测到 Cloudflare 拦截，{self.clearance_failure_reason}", "yellow")
-            return None
-        step(index, "检测到 Cloudflare 拦截，尝试刷新 clearance", "yellow")
-        bundle = proxy_settings.refresh_clearance(
-            target_url=target_url,
-            proxy=self.proxy,
-            force=True,
-            upstream=True,
-        )
-        if bundle is not None:
-            _apply_clearance_to_session(self.session, bundle)
-            self.clearance_user_agent = bundle.user_agent or self.clearance_user_agent
-            step(index, "Cloudflare clearance 刷新完成，重试当前请求", "yellow")
-        else:
-            self.clearance_failure_reason = "clearance 刷新未返回可用 Cookie，请检查 FlareSolverr URL、代理和出口 IP"
-            step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
-        return bundle
-
     def _platform_authorize(self, email: str, index: int) -> None:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
@@ -439,10 +599,7 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
-            # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
-            # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
-            "screen_hint": "signup",
+            "screen_hint": "login_or_signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -454,46 +611,24 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        target_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-        headers = self._navigate_headers(f"{platform_base}/")
-        headers = _headers_with_clearance(headers, target_url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "get", target_url, headers=headers, allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        if resp is None:
+            raise RuntimeError(error or "platform_authorize_failed")
         if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            retry_headers = _headers_with_clearance(self._navigate_headers(f"{platform_base}/"), target_url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "get", target_url, headers=retry_headers, allow_redirects=True, verify=False)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
-        if resp is None or resp.status_code != 200:
-            err = _response_json(resp).get("error", {}) if resp is not None else {}
+            # Cloudflare 挑战页通常返回完整 HTML，实时日志只保留结论，避免刷屏。
+            step(index, "platform authorize 返回 Cloudflare challenge，按 1.1.7 兼容策略继续尝试；", "yellow")
+        elif resp.status_code != 200:
+            err = _response_json(resp).get("error", {})
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             debug = _response_debug_detail(resp)
-            status = getattr(resp, "status_code", "unknown")
-            raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
-        landed = _authorize_landed_page(resp)
-        # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
-        # 真正的判定交给 user/register（失败会 dump 完整响应）。
-        step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
+            step(index, f"platform authorize 返回 HTTP {resp.status_code}{detail}，继续使用已建立的授权会话；{debug}", "yellow")
+        step(index, "platform authorize 完成")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
-        url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
-        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
-        if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = self._json_headers(f"{auth_base}/create-account/password")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
-            headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
@@ -504,17 +639,7 @@ class PlatformRegistrar:
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
-        url = f"{auth_base}/api/accounts/email-otp/send"
-        headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
-        if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
@@ -533,21 +658,9 @@ class PlatformRegistrar:
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
-        url = f"{auth_base}/api/accounts/create_account"
         headers = self._json_headers(f"{auth_base}/about-you")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-        resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
-        if _is_cloudflare_challenge(resp):
-            bundle = self._refresh_cloudflare_clearance(auth_base, index)
-            if bundle is None:
-                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = self._json_headers(f"{auth_base}/about-you")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-            headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
-            resp, error = request_with_local_retry(self.session, "post", url, json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
             if data.get("message") == "Failed to create account. Please try again.":
@@ -572,28 +685,22 @@ class PlatformRegistrar:
         mailbox = create_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
-            mail_provider.release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
-        try:
-            password = _random_password()
-            first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
-            self._register_user(email, password, index)
-            self._send_otp(index)
-            step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox)
-            if not code:
-                raise RuntimeError("等待注册验证码超时")
-            step(index, f"收到注册验证码: {code}")
-            self._validate_otp(code, index)
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-            tokens = self._exchange_registered_tokens(index)
-        except Exception as error:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
-            raise
-        mail_provider.mark_mailbox_result(mailbox, success=True)
+        password = _random_password()
+        first_name, last_name = _random_name()
+        self._platform_authorize(email, index)
+        self._register_user(email, password, index)
+        self._send_otp(index)
+        step(index, "开始等待注册验证码")
+        code = wait_for_code(mailbox)
+        if not code:
+            raise RuntimeError("等待注册验证码超时")
+        step(index, f"收到注册验证码: {code}")
+        self._validate_otp(code, index)
+        self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+        tokens = self._exchange_registered_tokens(index)
         return {
             "email": email,
             "password": password,
