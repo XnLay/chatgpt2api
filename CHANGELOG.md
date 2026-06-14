@@ -2,6 +2,9 @@
 
 ## Unreleased
 
++ [新增] 号池管理页展示账号当前图片在途数 `image_inflight`，用于诊断并发槽位未释放问题。
++ [新增] 生图冗余倍率 `image_redundancy_multiplier`，请求多张图片时可额外并发生成候选结果并只返回所需数量。
+
 ## 1.5.0 - 2026-06-13
 
 + [新增] 新增 WARP / Privoxy / FlareSolverr 清障方案，用于上游请求遇到 Cloudflare 拦截时刷新 clearance。

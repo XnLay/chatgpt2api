@@ -73,6 +73,17 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["status"], "正常")
             self.assertTrue(updated["image_quota_unknown"])
 
+    def test_list_accounts_includes_image_inflight_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-1", "token-2"])
+            service._image_inflight["token-1"] = 2
+
+            items = {item["access_token"]: item for item in service.list_accounts()}
+
+            self.assertEqual(items["token-1"]["image_inflight"], 2)
+            self.assertEqual(items["token-2"]["image_inflight"], 0)
+
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))

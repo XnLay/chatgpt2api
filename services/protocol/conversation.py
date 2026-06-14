@@ -1443,7 +1443,14 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
-    if request.n <= 1:
+    user_n = max(1, int(request.n or 1))
+    multiplier = config.image_redundancy_multiplier
+    effective_n = user_n
+    if multiplier > 1.0:
+        # 冗余任务用于提高多图成功率，限制上限避免一次请求占满过多账号槽位。
+        effective_n = min(max(1, int(round(user_n * multiplier))), 8)
+
+    if effective_n <= 1:
         # 单张图片，直接执行（无需线程池开销）
         outputs = _generate_single_image(request, 1, 1)
         for output in outputs:
@@ -1451,30 +1458,32 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         return
 
     # 多张图片：根据配置选择并行或串行执行
-    if not config.image_parallel_generation:
+    if not config.image_parallel_generation and multiplier <= 1.0:
         logger.info({
             "event": "image_serial_generation_start",
-            "n": request.n,
+            "n": user_n,
             "model": request.model,
         })
-        for index in range(1, request.n + 1):
-            outputs = _generate_single_image(request, index, request.n)
+        for index in range(1, effective_n + 1):
+            outputs = _generate_single_image(request, index, effective_n)
             for output in outputs:
                 yield output
         return
 
     logger.info({
         "event": "image_parallel_generation_start",
-        "n": request.n,
+        "n": user_n,
+        "effective_n": effective_n,
+        "multiplier": multiplier,
         "model": request.model,
     })
     # 每张图片一个线程，同时启动
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
-        for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
+    with ThreadPoolExecutor(max_workers=effective_n) as executor:
+        for index in range(1, effective_n + 1):
+            future = executor.submit(_generate_single_image, request, index, effective_n)
             futures[future] = index
 
         # 按完成顺序收集结果
@@ -1491,17 +1500,22 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 })
 
     # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
-    emitted = False
+    emitted = 0
     last_error = ""
     # 先 yield 所有成功的结果
-    for index in range(1, request.n + 1):
+    for index in range(1, effective_n + 1):
+        if emitted >= user_n:
+            break
         if index in results:
             for output in results[index]:
-                emitted = True
+                if output.kind == "result":
+                    if emitted >= user_n:
+                        break
+                    emitted += 1
                 yield output
         elif index in errors:
             last_error = str(errors[index])
-            if not emitted:
+            if emitted == 0:
                 logger.warning({
                     "event": "image_parallel_failure_before_success",
                     "failed_index": index,
@@ -1510,15 +1524,15 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     # 如果有失败但也有成功，记录警告
     if emitted:
-        for index in range(1, request.n + 1):
+        for index in range(1, effective_n + 1):
             if index in errors:
                 logger.warning({
                     "event": "image_parallel_partial_failure",
-                    "failed_index": index,
+                    "index": index,
                     "error": str(errors[index])[:200],
                 })
 
-    if not emitted:
+    if emitted == 0:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")

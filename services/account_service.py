@@ -1056,8 +1056,18 @@ class AccountService:
             return dict(account) if account else None
 
     def list_accounts(self) -> list[dict]:
+        """返回账号副本，并附加当前图片在途数。
+
+        image_inflight 是内存态并发计数，用于定位账号看似正常但仍被图片调度排除的问题。
+        """
         with self._lock:
-            return [dict(item) for item in self._accounts.values()]
+            items = []
+            for item in self._accounts.values():
+                account = dict(item)
+                token = str(account.get("access_token") or "")
+                account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                items.append(account)
+            return items
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:

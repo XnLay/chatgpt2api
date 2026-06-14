@@ -1065,7 +1065,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1000px] text-left">
+              <table className="w-full min-w-[1080px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -1082,6 +1082,7 @@ function AccountsPageContent() {
                     <th className="w-32 px-4 py-3">创建时间</th>
                     <th className="w-24 px-4 py-3">额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
+                    <th className="w-18 px-4 py-3">在途</th>
                     <th className="w-18 px-4 py-3">成功</th>
                     <th className="w-18 px-4 py-3">失败</th>
                     <th className="w-24 px-4 py-3">操作</th>
@@ -1172,6 +1173,26 @@ function AccountsPageContent() {
                                 {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}
                                 <div>{restore.absolute}</div>
                               </div>
+                            );
+                          })()}
+                        </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const inflight = account.image_inflight ?? 0;
+                            return (
+                              <span
+                                className={cn(
+                                  "tabular-nums",
+                                  inflight > 0 ? "font-semibold text-amber-600" : "text-stone-400",
+                                )}
+                                title={
+                                  inflight > 0
+                                    ? "当前正在生成的图片数。号池空闲时此值持续大于 0，说明并发槽位可能未释放。"
+                                    : "当前无在途生图任务"
+                                }
+                              >
+                                {inflight}
+                              </span>
                             );
                           })()}
                         </td>

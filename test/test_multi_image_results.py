@@ -6,7 +6,7 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_outputs_with_pool
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -179,6 +179,31 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual([event["output_index"] for event in done_events], [0, 1])
         self.assertEqual([item["result"] for item in completed["output"]], [first, second])
+
+    def test_redundancy_multiplier_generates_extra_images_but_returns_requested_count(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        def fake_generate(request: ConversationRequest, index: int, total: int) -> list[ImageOutput]:
+            calls.append((index, total))
+            return [
+                ImageOutput(
+                    kind="result",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    data=[{"b64_json": f"image-{index}"}],
+                )
+            ]
+
+        request = ConversationRequest(model="gpt-image-2", prompt="draw", n=2)
+        with (
+            mock.patch.dict(config.data, {"image_redundancy_multiplier": 2.0, "image_parallel_generation": True}),
+            mock.patch("services.protocol.conversation._generate_single_image", side_effect=fake_generate),
+        ):
+            outputs = list(stream_image_outputs_with_pool(request))
+
+        self.assertEqual(sorted(calls), [(1, 4), (2, 4), (3, 4), (4, 4)])
+        self.assertEqual([item.data[0]["b64_json"] for item in outputs], ["image-1", "image-2"])
 
 
 if __name__ == "__main__":

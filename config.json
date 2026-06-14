@@ -48,6 +48,7 @@
   },
   "image_account_concurrency": 3,
   "image_parallel_generation": true,
+  "image_redundancy_multiplier": 1.0,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,
   "image_storage": {
