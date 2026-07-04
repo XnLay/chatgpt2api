@@ -21,17 +21,18 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
-    def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
+    def test_image_accounts_require_positive_quota(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "限流", "image_quota_unknown": True, "quota": 0}
+                {"status": "限流", "quota": 1}
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "正常", "image_quota_unknown": True, "quota": 0}
+                {"status": "正常", "quota": 0}
             )
         )
+        self.assertTrue(AccountService._is_image_account_available({"status": "正常", "quota": 1}))
 
     def test_prolite_variants_are_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -53,7 +54,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 )
             )
 
-    def test_mark_image_result_does_not_consume_unknown_quota(self) -> None:
+    def test_mark_image_result_consumes_quota(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_accounts(["token-1"])
@@ -61,8 +62,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 "token-1",
                 {
                     "status": "正常",
-                    "quota": 0,
-                    "image_quota_unknown": True,
+                    "quota": 1,
                 },
             )
 
@@ -70,8 +70,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertIsNotNone(updated)
             self.assertEqual(updated["quota"], 0)
-            self.assertEqual(updated["status"], "正常")
-            self.assertTrue(updated["image_quota_unknown"])
+            self.assertEqual(updated["status"], "限流")
 
     def test_list_accounts_includes_image_inflight_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -215,7 +214,7 @@ class AccountCapabilityTests(unittest.TestCase):
             finally:
                 register_service_module.account_service = original_account_service
 
-    def test_register_normalize_applies_env_mail_provider_overrides(self) -> None:
+    def test_register_normalize_keeps_saved_mail_provider_when_env_exists(self) -> None:
         raw = {
             "mail": {
                 "request_timeout": 30,
@@ -233,8 +232,7 @@ class AccountCapabilityTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             cfg = register_service_module._normalize(raw)
 
-        self.assertEqual(cfg["mail"]["providers"][0]["type"], "inbucket")
-        self.assertEqual(cfg["mail"]["providers"][0]["domain"], ["env.example"])
+        self.assertEqual(cfg["mail"]["providers"][0]["type"], "cloudmail_gen")
 
     def test_register_default_config_uses_available_pool_monitor(self) -> None:
         with patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "test-auth"}, clear=True):

@@ -103,5 +103,6 @@
       "enabled": true,
       "url": "https://canvas.best"
     }
-  }
+  },
+  "image_remove_conversation_after_result": true
 }

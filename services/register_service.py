@@ -27,6 +27,19 @@ def _default_config() -> dict:
     return {**openai_register.config, "mode": DEFAULT_REGISTER_MODE, "target_quota": 100, "target_available": DEFAULT_TARGET_AVAILABLE, "check_interval": DEFAULT_CHECK_INTERVAL, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
+def _safe_bool(value: object, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return fallback
+
+
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
@@ -37,8 +50,13 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or DEFAULT_CHECK_INTERVAL))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
+    mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+    cfg["mail"] = {**default_mail, **mail}
+    cfg["mail"]["api_use_register_proxy"] = _safe_bool(cfg["mail"].get("api_use_register_proxy"), True)
+    cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
-    cfg = openai_register.apply_env_overrides(cfg)
+    # openai_register.config 已在启动时合并环境变量；保存归一化不能再次覆盖页面提交值。
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
     cfg["stats"] = stats
@@ -72,15 +90,14 @@ class RegisterService:
         with self._lock:
             return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
 
-    def _inject_proxy_to_mail(self) -> None:
-        proxy = str(self._config.get("proxy") or "").strip()
-        if proxy and isinstance(self._config.get("mail"), dict):
-            self._config["mail"]["proxy"] = proxy
+    def _drop_mail_proxy(self) -> None:
+        if isinstance(self._config.get("mail"), dict):
+            self._config["mail"].pop("proxy", None)
 
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._config = _normalize({**self._config, **updates})
-            self._inject_proxy_to_mail()
+            self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             self._save()
             return self.get()
@@ -94,7 +111,7 @@ class RegisterService:
                 return self.get()
             self._config["enabled"] = True
             self._stop_event.clear()
-            self._inject_proxy_to_mail()
+            self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}

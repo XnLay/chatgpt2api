@@ -22,7 +22,6 @@ export type Account = {
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
-  image_quota_unknown?: boolean;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -172,6 +171,7 @@ export type SettingsConfig = {
   image_redundancy_multiplier?: number | string;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
+  image_remove_conversation_after_result?: boolean;
   image_settle_secs?: number | string;
   image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;
@@ -324,6 +324,7 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
+    api_use_register_proxy: boolean;
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;

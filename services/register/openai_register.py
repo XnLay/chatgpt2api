@@ -179,6 +179,7 @@ config = {
         "request_timeout": 30,
         "wait_timeout": 30,
         "wait_interval": 2,
+        "api_use_register_proxy": True,
         "providers": [],
     },
     "proxy": "",
@@ -365,12 +366,53 @@ def _is_cloudflare_challenge(resp) -> bool:
     return "cloudflare" in server and "text/html" in content_type and "challenge" in text
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(config["mail"], username)
+def _truthy(value: object, fallback: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return fallback
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(config["mail"], mailbox)
+def _mail_config(register_proxy: str = "") -> dict:
+    mail = config["mail"] if isinstance(config.get("mail"), dict) else {}
+    use_register_proxy = _truthy(mail.get("api_use_register_proxy"), True)
+    proxy = str(register_proxy or "").strip() if use_register_proxy else ""
+    return {**mail, "api_use_register_proxy": use_register_proxy, "proxy": proxy}
+
+
+def _authorize_landed_page(resp) -> str:
+    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
+
+    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
+    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
+    """
+    if resp is None:
+        return ""
+    final_url = str(getattr(resp, "url", "") or "").lower()
+    data = _response_json(resp)
+    page_type = ""
+    page = data.get("page") if isinstance(data, dict) else None
+    if isinstance(page, dict):
+        page_type = str(page.get("type") or "").lower()
+    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
+        return "signup"
+    if "/log-in" in final_url or "/login" in final_url or page_type in {"login", "password_verification"}:
+        return "login"
+    return ""
+
+
+def create_mailbox(username: str | None = None, register_proxy: str = "") -> dict:
+    return mail_provider.create_mailbox(_mail_config(register_proxy), username)
+
+
+def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
+    return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
 
 
 class SentinelTokenGenerator:
@@ -567,7 +609,8 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
-        self.session = create_session(proxy)
+        self.proxy = str(proxy or "").strip()
+        self.session = create_session(self.proxy)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
@@ -682,7 +725,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        mailbox = create_mailbox(register_proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
@@ -694,7 +737,7 @@ class PlatformRegistrar:
         self._register_user(email, password, index)
         self._send_otp(index)
         step(index, "开始等待注册验证码")
-        code = wait_for_code(mailbox)
+        code = wait_for_code(mailbox, register_proxy=self.proxy)
         if not code:
             raise RuntimeError("等待注册验证码超时")
         step(index, f"收到注册验证码: {code}")
