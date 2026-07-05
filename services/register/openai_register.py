@@ -254,6 +254,9 @@ navigate_headers = {
 
 
 def log(text: str, color: str = "") -> None:
+    text = str(text or "")
+    if len(text) > 1000:
+        text = text[:997].rstrip() + "..."
     colors = {"red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
     if register_log_sink:
         try:
@@ -320,7 +323,7 @@ def _response_json(resp) -> dict:
         return {}
 
 
-def _response_debug_detail(resp, limit: int = 800) -> str:
+def _response_debug_detail(resp, limit: int = 180) -> str:
     if resp is None:
         return ""
     data = _response_json(resp)
@@ -602,7 +605,7 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         timeout=60,
     )
     if resp.status_code != 200:
-        print(resp.text)
+        log(f"OAuth token rejected: {str(resp.text or '')[:500]}", "red")
         return None
     return _response_json(resp)
 

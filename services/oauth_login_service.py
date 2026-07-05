@@ -33,6 +33,7 @@ from services.register.openai_register import (
     sec_ch_ua,
     user_agent,
 )
+from utils.log import logger
 
 
 class OAuthLoginError(Exception):
@@ -234,13 +235,12 @@ class OAuthLoginService:
                     detail = str(response.text or "")[:300]
                 except Exception:
                     detail = ""
-            # 打到 docker logs 方便排错——OAuth 换 token 的失败原因往往只有这里能看到
-            print(
-                f"[oauth-login] /api/accounts/oauth/token rejected: "
-                f"status={response.status_code} detail={detail!r} "
-                f"raw_body={(getattr(response, 'text', '') or '')[:500]!r}",
-                flush=True,
-            )
+            logger.warning({
+                "event": "oauth_token_rejected",
+                "status": response.status_code,
+                "detail": detail,
+                "raw_body": (getattr(response, "text", "") or "")[:500],
+            })
             raise OAuthLoginError(
                 f"OpenAI 拒绝换 token (HTTP {response.status_code}){': ' + detail if detail else ''}"
             )

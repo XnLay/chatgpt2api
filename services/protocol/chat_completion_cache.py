@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -123,6 +124,33 @@ class ChatCompletionCache:
     def _copy(value: Any) -> Any:
         return copy.deepcopy(value)
 
+    @staticmethod
+    def _rough_size(value: Any, limit: int) -> int:
+        total = 0
+        seen: set[int] = set()
+        stack = [value]
+        while stack:
+            item = stack.pop()
+            item_id = id(item)
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            total += sys.getsizeof(item)
+            if total > limit:
+                return total
+            if isinstance(item, dict):
+                for key, nested in item.items():
+                    stack.append(key)
+                    stack.append(nested)
+            elif isinstance(item, (list, tuple, set, frozenset)):
+                stack.extend(item)
+        return total
+
+    @classmethod
+    def _within_entry_limit(cls, value: Any, settings: dict[str, object]) -> bool:
+        max_entry_bytes = int(settings.get("max_entry_bytes") or 0)
+        return max_entry_bytes <= 0 or cls._rough_size(value, max_entry_bytes) <= max_entry_bytes
+
     def get_or_compute_response(self, key: str, compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         settings = self._settings()
         if not settings.get("enabled") or int(settings.get("ttl_seconds") or 0) <= 0:
@@ -163,13 +191,15 @@ class ChatCompletionCache:
                 inflight.condition.notify_all()
             raise
 
+        cacheable = self._within_entry_limit(value, settings)
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
-            self._prune_locked(time.time(), max_entries)
+            if cacheable:
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
+                self._prune_locked(time.time(), max_entries)
             self._inflight.pop(key, None)
         with inflight.condition:
-            inflight.value = self._copy(value)
+            inflight.value = value
             inflight.done = True
             inflight.condition.notify_all()
         return value
@@ -224,13 +254,15 @@ class ChatCompletionCache:
                 inflight.condition.notify_all()
             raise
 
+        cacheable = self._within_entry_limit(chunks, settings)
         expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
-            self._prune_locked(time.time(), max_entries)
+            if cacheable:
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
+                self._prune_locked(time.time(), max_entries)
             self._inflight.pop(key, None)
         with inflight.condition:
-            inflight.value = self._copy(chunks)
+            inflight.value = chunks
             inflight.done = True
             inflight.condition.notify_all()
 

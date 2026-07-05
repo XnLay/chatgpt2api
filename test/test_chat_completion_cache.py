@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 import json
 import base64
+from typing import Any
 
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
@@ -25,6 +26,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
             "enabled": True,
             "ttl_seconds": 60,
             "max_entries": 32,
+            "max_entry_bytes": 256 * 1024,
             "dedupe_inflight": True,
             "stream_cache": True,
             "normalize_messages": True,
@@ -65,6 +67,24 @@ class ChatCompletionCacheTests(unittest.TestCase):
             first["choices"][0]["message"]["content"],
             second["choices"][0]["message"]["content"],
         )
+
+    def test_large_response_is_not_retained_in_cache(self) -> None:
+        config.data["chat_completion_cache"] = {
+            **config.data["chat_completion_cache"],
+            "max_entry_bytes": 128,
+        }
+        calls = 0
+
+        def compute() -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"answer": "x" * 1000, "call": calls}
+
+        first = chat_completion_cache.get_or_compute_response("too-large", compute)
+        second = chat_completion_cache.get_or_compute_response("too-large", compute)
+
+        self.assertEqual(calls, 2)
+        self.assertNotEqual(first["call"], second["call"])
 
     def test_cache_key_distinguishes_thinking_effort_inputs(self) -> None:
         messages = [{"role": "user", "content": "same prompt"}]

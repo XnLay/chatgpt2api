@@ -21,6 +21,10 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+LOG_TAIL_CHUNK_BYTES = 64 * 1024
+LOG_FILE_MAX_BYTES = 8 * 1024 * 1024
+LOG_FILE_KEEP_BYTES = 6 * 1024 * 1024
+MAX_LOG_URLS = 20
 
 
 class LogService:
@@ -29,11 +33,11 @@ class LogService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _legacy_id(raw_line: str, line_number: int) -> str:
-        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
+    def _legacy_id(raw_line: str) -> str:
+        payload = raw_line.encode("utf-8", errors="ignore")
         return hashlib.sha1(payload).hexdigest()[:24]
 
-    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+    def _parse_line(self, raw_line: str) -> dict[str, Any] | None:
         try:
             item = json.loads(raw_line)
         except Exception:
@@ -41,7 +45,7 @@ class LogService:
         if not isinstance(item, dict):
             return None
         parsed = dict(item)
-        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, line_number))
+        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line))
         return parsed
 
     @staticmethod
@@ -70,14 +74,56 @@ class LogService:
         }
         with self.path.open("a", encoding="utf-8") as file:
             file.write(self._serialize_item(item) + "\n")
+        try:
+            self._trim_if_needed()
+        except OSError:
+            pass
+
+    def _trim_if_needed(self) -> None:
+        size = self.path.stat().st_size
+        if size <= LOG_FILE_MAX_BYTES:
+            return
+
+        keep_bytes = min(LOG_FILE_KEEP_BYTES, LOG_FILE_MAX_BYTES)
+        start = max(0, size - keep_bytes)
+        temp_path = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            with self.path.open("rb") as source, temp_path.open("wb") as target:
+                source.seek(start)
+                if start > 0:
+                    source.readline()
+                while chunk := source.read(LOG_TAIL_CHUNK_BYTES):
+                    target.write(chunk)
+            temp_path.replace(self.path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+    def _iter_tail_lines(self):
+        with self.path.open("rb") as file:
+            file.seek(0, 2)
+            position = file.tell()
+            buffer = b""
+
+            while position > 0:
+                read_size = min(LOG_TAIL_CHUNK_BYTES, position)
+                position -= read_size
+                file.seek(position)
+                lines = (file.read(read_size) + buffer).split(b"\n")
+                buffer = lines[0]
+                for raw_line in reversed(lines[1:]):
+                    if raw_line:
+                        yield raw_line.decode("utf-8", "replace")
+
+            if buffer:
+                yield buffer.decode("utf-8", "replace")
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
+        for raw_line in self._iter_tail_lines():
+            item = self._parse_line(raw_line)
             if item is None:
                 continue
             if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
@@ -91,22 +137,21 @@ class LogService:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
+        temp_path = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
         removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as source, temp_path.open("w", encoding="utf-8") as target:
+                for raw_line in source:
+                    line = raw_line.rstrip("\n")
+                    item = self._parse_line(line)
+                    if item is not None and str(item.get("id") or "") in target_ids:
+                        removed += 1
+                        continue
+                    target.write(raw_line if raw_line.endswith("\n") else f"{raw_line}\n")
+            temp_path.replace(self.path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
         return {"removed": removed}
 
 
@@ -270,14 +315,22 @@ class LoggedCall:
 
     def stream(self, items):
         urls: list[str] = []
-        account_emails: list[str] = []
-        conversation_ids: list[str] = []
+        seen_urls: set[str] = set()
+        account_email = ""
+        conversation_id = ""
         failed = False
         try:
             for item in items:
-                urls.extend(_collect_urls(item))
-                account_emails.extend(_collect_account_emails(item))
-                conversation_ids.extend(_collect_conversation_ids(item))
+                for url in _collect_urls(item):
+                    if url not in seen_urls and len(urls) < MAX_LOG_URLS:
+                        seen_urls.add(url)
+                        urls.append(url)
+                if not account_email:
+                    emails = _collect_account_emails(item)
+                    account_email = emails[0] if emails else ""
+                if not conversation_id:
+                    conv_ids = _collect_conversation_ids(item)
+                    conversation_id = conv_ids[0] if conv_ids else ""
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
@@ -286,8 +339,8 @@ class LoggedCall:
                 status="failed",
                 error=str(exc),
                 urls=urls,
-                account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
-                conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+                account_email=(account_email or getattr(exc, "account_email", "")),
+                conversation_id=(conversation_id or getattr(exc, "conversation_id", "")),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.protocol.conversation import ImageGenerationError, public_image_error_message
@@ -296,8 +349,7 @@ class LoggedCall:
             raise
         finally:
             if not failed:
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
-                         conversation_id=conversation_ids[0] if conversation_ids else "")
+                self.log("流式调用结束", urls=urls, account_email=account_email, conversation_id=conversation_id)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
@@ -318,7 +370,7 @@ class LoggedCall:
         if self.request_shape:
             detail["request_shape"] = self.request_shape
         if error:
-            detail["error"] = error
+            detail["error"] = _request_excerpt(error)
         email = str(account_email or "").strip()
         if not email:
             emails = _collect_account_emails(result)
@@ -331,7 +383,12 @@ class LoggedCall:
             conv_id = conv_ids[0] if conv_ids else ""
         if conv_id:
             detail["conversation_id"] = conv_id
-        collected_urls = [*(urls or []), *_collect_urls(result)]
+        collected_urls: list[str] = []
+        for url in [*(urls or []), *_collect_urls(result)]:
+            if url not in collected_urls:
+                collected_urls.append(url)
+            if len(collected_urls) >= MAX_LOG_URLS:
+                break
         if collected_urls and not self.endpoint.startswith("/v1/search"):
-            detail["urls"] = list(dict.fromkeys(collected_urls))
+            detail["urls"] = collected_urls
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

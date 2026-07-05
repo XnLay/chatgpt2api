@@ -71,6 +71,8 @@ class RegisterService:
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
         self._last_pool_refresh_at = 0.0
+        self._last_pool_check_log = ""
+        self._last_pool_check_log_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -136,6 +138,8 @@ class RegisterService:
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
+            self._last_pool_check_log = ""
+            self._last_pool_check_log_at = 0.0
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
@@ -144,8 +148,20 @@ class RegisterService:
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
-            self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
+            value = str(text)
+            if len(value) > 480:
+                value = value[:477].rstrip() + "..."
+            self._logs.append({"time": _now(), "text": value, "level": str(color or "info")})
             self._logs = self._logs[-300:]
+
+    def _append_pool_check_log(self, text: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if text == self._last_pool_check_log and now - self._last_pool_check_log_at < 60:
+                return
+            self._last_pool_check_log = text
+            self._last_pool_check_log_at = now
+        self._append_log(text, "yellow")
 
     def _refresh_pool_accounts(self, cfg: dict) -> None:
         mode = str(cfg.get("mode") or "total")
@@ -190,11 +206,11 @@ class RegisterService:
         self._bump(**metrics)
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前可用账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            self._append_pool_check_log(f"检查号池：当前可用账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前可用账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            self._append_pool_check_log(f"检查号池：当前可用账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 

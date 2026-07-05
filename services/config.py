@@ -41,9 +41,10 @@ DEFAULT_IMAGE_STORAGE = {
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
-    "max_entries": 256,
+    "max_entries": 32,
+    "max_entry_bytes": 256 * 1024,
     "dedupe_inflight": True,
-    "stream_cache": True,
+    "stream_cache": False,
     "normalize_messages": True,
     "drop_adjacent_duplicates": True,
     "drop_assistant_history": False,
@@ -175,6 +176,11 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
             source.get("max_entries"),
             int(DEFAULT_CHAT_COMPLETION_CACHE["max_entries"]),
             1,
+        ),
+        "max_entry_bytes": _normalize_positive_int(
+            source.get("max_entry_bytes"),
+            int(DEFAULT_CHAT_COMPLETION_CACHE["max_entry_bytes"]),
+            0,
         ),
         "dedupe_inflight": _normalize_bool(
             source.get("dedupe_inflight"),

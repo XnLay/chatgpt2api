@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from utils.log import logger
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -95,6 +96,12 @@ def _wait_for_next_account_refresh(stop_event: Event, started_at: float) -> bool
     return True
 
 
+def _error_summary(errors: object) -> dict[str, object]:
+    items = errors if isinstance(errors, list) else ([errors] if errors else [])
+    # 只记录少量样本，避免大量账号错误刷爆 Render 日志。
+    return {"count": len(items), "sample": items[:3]}
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
@@ -109,23 +116,23 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
-                    print(
-                        "[account-watcher] checking "
-                        f"{len(tokens)} accounts, "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(invalid_tokens)} pending invalid accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
-                    )
+                    logger.debug({
+                        "event": "account_watcher_check",
+                        "accounts": len(tokens),
+                        "limited_accounts": len(limited_tokens),
+                        "pending_invalid_accounts": len(invalid_tokens),
+                        "expiring_access_tokens": len(expiring_tokens),
+                    })
                     result = account_service.refresh_accounts(tokens, confirm_invalid=True)
                     if result.get("errors"):
-                        print(f"[account-watcher] refresh errors: {result['errors']}")
+                        logger.warning({"event": "account_watcher_refresh_errors", **_error_summary(result["errors"])})
                 if keepalive_tokens:
-                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
+                    logger.debug({"event": "account_watcher_keepalive", "refresh_tokens": len(keepalive_tokens)})
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)
                     if result.get("errors"):
-                        print(f"[account-watcher] keepalive errors: {result['errors']}")
+                        logger.warning({"event": "account_watcher_keepalive_errors", **_error_summary(result["errors"])})
             except Exception as exc:
-                print(f"[account-watcher] fail {exc}")
+                logger.warning({"event": "account_watcher_failed", "error": str(exc)})
             if _wait_for_next_account_refresh(stop_event, started_at):
                 break
 
