@@ -17,14 +17,15 @@ class _FakeCookies:
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, headers=None, text="", url="https://auth.openai.com/test"):
+    def __init__(self, status_code=200, headers=None, text="", url="https://auth.openai.com/test", json_data=None):
         self.status_code = status_code
         self.headers = headers or {}
         self.text = text
         self.url = url
+        self._json_data = json_data or {}
 
     def json(self):
-        return {}
+        return self._json_data
 
 
 class _FakeSession:
@@ -141,6 +142,31 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         self.assertNotIn("<!DOCTYPE html>", challenge_logs[0])
         self.assertNotIn("body=", challenge_logs[0])
         self.assertNotIn("url=", challenge_logs[0])
+
+    def test_create_account_sends_sentinel_so_token(self):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.session = _FakeSession(
+            _FakeResponse(
+                status_code=200,
+                json_data={"continue_url": "https://platform.openai.com/auth/callback?code=oauth-code&state=ok"},
+            )
+        )
+        registrar.device_id = "device-id"
+        artifacts = openai_register.SentinelArtifacts(
+            token='{"p":"proof","t":"","c":"challenge","id":"device-id","flow":"oauth_create_account"}',
+            oai_sc_value="0challenge",
+            so_token="so-token-value",
+            sdk_version="test-sdk",
+        )
+
+        with patch.object(openai_register, "build_sentinel_artifacts", return_value=artifacts):
+            registrar._create_account("Test User", "2000-01-01", 1)
+
+        request_headers = registrar.session.requests[0][2]["headers"]
+        self.assertEqual(request_headers["openai-sentinel-token"], artifacts.token)
+        self.assertEqual(request_headers["openai-sentinel-so-token"], "so-token-value")
+        self.assertEqual(registrar.platform_auth_code, "oauth-code")
+        self.assertTrue(any(args == ("oai-sc", "0challenge") for args, _kwargs in registrar.session.cookies.items))
 
 
 class OpenAIRegisterEnvConfigTests(unittest.TestCase):

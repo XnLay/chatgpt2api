@@ -460,6 +460,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const scrollRestoreGenerationRef = useRef(0);
 
   const config = useSettingsStore((state) => state.config);
+  const loadConfig = useSettingsStore((state) => state.loadConfig);
+  const configuredDefaultImageModel = String(config?.image_default_model || "gpt-image-2") as ImageModel;
   const imageTimeoutRetrySecs = Number(config?.image_timeout_retry_secs || 30);
 
   const [imagePrompt, setImagePrompt] = useState("");
@@ -494,6 +496,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     taskId: string;
     taskError: string;
   } | null>(null);
+
+  useEffect(() => {
+    if (!config) {
+      void loadConfig();
+    }
+  }, [config, loadConfig]);
 
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
   const selectedConversation = useMemo(
@@ -698,10 +706,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         setImageModels(available);
         const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
         setImageModel((current) => {
+          if (storedModel && available.includes(storedModel)) {
+            return storedModel;
+          }
+          if (available.includes(configuredDefaultImageModel)) {
+            return configuredDefaultImageModel;
+          }
           if (available.includes(current)) {
             return current;
           }
-          return normalizeStoredImageModel(storedModel, available);
+          return normalizeStoredImageModel(null, available);
         });
       } catch {
         if (!cancelled) {
@@ -714,7 +728,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [configuredDefaultImageModel]);
 
   const loadQuota = useCallback(async () => {
     if (!isAdmin) {

@@ -58,6 +58,42 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_image_defaults_and_fallback_poll_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "auth-key": "test-auth",
+                        "image_default_model": "team-codex-gpt-image-2",
+                        "image_fallback_poll_enabled": "true",
+                        "image_fallback_poll_max_retries": "5",
+                        "image_fallback_poll_timeout_secs": "480",
+                        "image_fallback_poll_wait_secs": "12.5",
+                        "image_fallback_poll_backoff_secs": "7",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = self.config_module.ConfigStore(path)
+
+        self.assertEqual(store.image_default_model, "team-codex-gpt-image-2")
+        self.assertTrue(store.image_fallback_poll_enabled)
+        self.assertEqual(store.image_fallback_poll_max_retries, 5)
+        self.assertEqual(store.image_fallback_poll_timeout_secs, 480)
+        self.assertEqual(store.image_fallback_poll_wait_secs, 12.5)
+        self.assertEqual(store.image_fallback_poll_backoff_secs, 7.0)
+
+    def test_invalid_image_default_model_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "test-auth", "image_default_model": "unknown"}), encoding="utf-8")
+
+            store = self.config_module.ConfigStore(path)
+
+        self.assertEqual(store.image_default_model, "gpt-image-2")
+
 
 if __name__ == "__main__":
     unittest.main()

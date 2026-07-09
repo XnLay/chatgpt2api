@@ -9,12 +9,13 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
+from services.protocol.conversation import default_image_model
 
 
 class ImageGenerationTaskRequest(BaseModel):
     client_task_id: str = Field(..., min_length=1)
     prompt: str = Field(..., min_length=1)
-    model: str = "gpt-image-2"
+    model: str | None = None
     size: str | None = None
     quality: str = "auto"
 
@@ -53,14 +54,15 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
+        model = str(body.model or default_image_model()).strip() or default_image_model()
+        await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
             return await run_in_threadpool(
                 image_task_service.submit_generation,
                 identity,
                 client_task_id=body.client_task_id,
                 prompt=body.prompt,
-                model=body.model,
+                model=model,
                 size=body.size,
                 quality=body.quality,
                 base_url=resolve_image_base_url(request),

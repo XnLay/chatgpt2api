@@ -23,6 +23,12 @@ from urllib3.util.retry import Retry
 
 from services.account_service import account_service
 from services.register import mail_provider
+from utils.sentinel import (
+    DEFAULT_SENTINEL_FLOW_TIMEOUT_MS,
+    SentinelArtifacts,
+    build_sentinel_artifacts as _build_sentinel_artifacts,
+    build_sentinel_token as _build_sentinel_token_tuple,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -418,102 +424,33 @@ def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
     return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
 
 
-class SentinelTokenGenerator:
-    MAX_ATTEMPTS = 500000
-    ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
-
-    def __init__(self, device_id: str, ua: str):
-        self.device_id = device_id
-        self.user_agent = ua
-        self.sid = str(uuid.uuid4())
-
-    @staticmethod
-    def _fnv1a_32(text: str) -> str:
-        h = 2166136261
-        for ch in text:
-            h ^= ord(ch)
-            h = (h * 16777619) & 0xFFFFFFFF
-        h ^= h >> 16
-        h = (h * 2246822507) & 0xFFFFFFFF
-        h ^= h >> 13
-        h = (h * 3266489909) & 0xFFFFFFFF
-        h ^= h >> 16
-        return format(h & 0xFFFFFFFF, "08x")
-
-    def _get_config(self) -> list:
-        perf_now = random.uniform(1000, 50000)
-        return [
-            "1920x1080",
-            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
-            4294705152,
-            random.random(),
-            self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
-            None,
-            None,
-            "en-US",
-            random.random(),
-            random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
-            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
-            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
-            perf_now,
-            self.sid,
-            "",
-            random.choice([4, 8, 12, 16]),
-            time.time() * 1000 - perf_now,
-        ]
-
-    @staticmethod
-    def _b64(data) -> str:
-        return base64.b64encode(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).decode("ascii")
-
-    def generate_requirements_token(self) -> str:
-        data = self._get_config()
-        data[3] = 1
-        data[9] = round(random.uniform(5, 50))
-        return "gAAAAAC" + self._b64(data)
-
-    def generate_token(self, seed: str, difficulty: str) -> str:
-        start = time.time()
-        data = self._get_config()
-        difficulty = str(difficulty or "0")
-        for i in range(self.MAX_ATTEMPTS):
-            data[3] = i
-            data[9] = round((time.time() - start) * 1000)
-            payload = self._b64(data)
-            if self._fnv1a_32(seed + payload)[: len(difficulty)] <= difficulty:
-                return "gAAAAAB" + payload + "~S"
-        return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
-
-
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    generator = SentinelTokenGenerator(device_id, user_agent)
-    resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": user_agent,
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
+    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
+    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
     )
-    data = _response_json(resp)
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-    pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
+    return sentinel_val
+
+
+def build_sentinel_artifacts(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    observer_timeout_ms: int = DEFAULT_SENTINEL_FLOW_TIMEOUT_MS,
+) -> SentinelArtifacts:
+    return _build_sentinel_artifacts(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        observer_timeout_ms=observer_timeout_ms,
     )
-    return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
 
 
 def _is_socks_proxy(proxy: str) -> bool:
@@ -554,7 +491,20 @@ def validate_otp(session: requests.Session, device_id: str, code: str):
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
+    sentinel_val, oai_sc_val = _build_sentinel_token_tuple(
+        session,
+        device_id,
+        "authorize_continue",
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+    )
+    headers["openai-sentinel-token"] = sentinel_val
+    if oai_sc_val:
+        for domain in (".openai.com", "openai.com", ".auth.openai.com", "auth.openai.com"):
+            try:
+                session.cookies.set("oai-sc", oai_sc_val, domain=domain)
+            except Exception:
+                continue
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -572,7 +522,23 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
 
 
+def _extract_callback_params_from_response(resp, data: dict | None = None) -> dict[str, str] | None:
+    candidates = [str((data or {}).get("continue_url") or "").strip()]
+    headers = getattr(resp, "headers", {}) or {}
+    candidates.append(str(headers.get("location") or headers.get("Location") or "").strip())
+    candidates.append(str(getattr(resp, "url", "") or "").strip())
+    for item in candidates:
+        callback_params = extract_oauth_callback_params_from_url(item)
+        if callback_params:
+            return callback_params
+    return None
+
+
 def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
+    if not str(code or "").strip():
+        raise RuntimeError("token换取失败: OAuth code 为空，create_account 未返回有效回调 code")
+    if not str(code_verifier or "").strip():
+        raise RuntimeError("token换取失败: code_verifier 为空")
     headers = {
         "accept": "*/*",
         "accept-language": "zh-CN,zh;q=0.9",
@@ -605,8 +571,7 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         timeout=60,
     )
     if resp.status_code != 200:
-        log(f"OAuth token rejected: {str(resp.text or '')[:500]}", "red")
-        return None
+        raise RuntimeError(f"token换取失败: oauth_token_http_{resp.status_code}, {_response_debug_detail(resp)}")
     return _response_json(resp)
 
 
@@ -634,6 +599,39 @@ class PlatformRegistrar:
         headers.update(_make_trace_headers())
         return headers
 
+    def _apply_sentinel_cookie(self, artifacts: SentinelArtifacts) -> None:
+        value = str(getattr(artifacts, "oai_sc_value", "") or "").strip()
+        if not value:
+            return
+        for domain in (".openai.com", "openai.com", ".auth.openai.com", "auth.openai.com"):
+            try:
+                self.session.cookies.set("oai-sc", value, domain=domain)
+            except Exception:
+                continue
+
+    def _log_sentinel_artifacts(self, index: int, flow: str, artifacts: SentinelArtifacts) -> None:
+        step(
+            index,
+            "Sentinel 准备完成"
+            f" flow={flow}"
+            f" sdk={artifacts.sdk_version or '?'}"
+            f" token_len={len(str(artifacts.token or ''))}"
+            f" so_token={'yes' if artifacts.so_token else 'no'}"
+            f" so_len={len(str(artifacts.so_token or ''))}"
+            f" wait_ms={artifacts.observer_timeout_ms}",
+        )
+
+    def _build_sentinel(self, flow: str, index: int, *, observer_timeout_ms: int = DEFAULT_SENTINEL_FLOW_TIMEOUT_MS) -> SentinelArtifacts:
+        artifacts = build_sentinel_artifacts(
+            self.session,
+            self.device_id,
+            flow,
+            observer_timeout_ms=observer_timeout_ms,
+        )
+        self._apply_sentinel_cookie(artifacts)
+        self._log_sentinel_artifacts(index, flow, artifacts)
+        return artifacts
+
     def _platform_authorize(self, email: str, index: int) -> None:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
@@ -645,7 +643,7 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            "screen_hint": "login_or_signup",
+            "screen_hint": "signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -673,7 +671,7 @@ class PlatformRegistrar:
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
+        headers["openai-sentinel-token"] = self._build_sentinel("username_password_create", index).token
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -705,7 +703,12 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+        artifacts = self._build_sentinel("oauth_create_account", index, observer_timeout_ms=5000)
+        headers["openai-sentinel-token"] = artifacts.token
+        if artifacts.so_token:
+            headers["openai-sentinel-so-token"] = artifacts.so_token
+        else:
+            step(index, "Sentinel 未生成 so-token，create_account 成功率可能偏低", "yellow")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
@@ -714,8 +717,10 @@ class PlatformRegistrar:
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         data = _response_json(resp)
-        callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
+        callback_params = _extract_callback_params_from_response(resp, data)
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
+        if not self.platform_auth_code:
+            raise RuntimeError("创建账号资料完成但未获得 OAuth code，无法换 token")
         step(index, "创建账号资料完成")
 
     def _exchange_registered_tokens(self, index: int) -> dict:

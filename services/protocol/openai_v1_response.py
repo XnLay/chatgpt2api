@@ -13,6 +13,7 @@ from services.protocol.conversation import (
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
+    default_image_model,
     encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
@@ -426,7 +427,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     prompt = extract_response_prompt(body.get("input"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
-    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    model = str(body.get("model") or default_image_model()).strip() or default_image_model()
     image_info = extract_response_image(body.get("input"))
     if image_info:
         image_data, mime_type = image_info

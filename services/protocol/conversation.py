@@ -123,6 +123,10 @@ TOOL_PARAMS_JSON_RE = re.compile(
 )
 
 
+def default_image_model() -> str:
+    return config.image_default_model
+
+
 def is_model_text_reply_instead_of_image(message: str) -> bool:
     """检测模型是否返回了文本回复（包含工具调用 JSON）而非实际生成图片。
 
@@ -1005,9 +1009,11 @@ def stream_image_outputs(
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
             # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
-            MAX_POLL_RETRIES = 3
-            for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
+            retry_poll_timeout = max(config.image_poll_timeout_secs, config.image_fallback_poll_timeout_secs)
+            max_poll_retries = config.image_fallback_poll_max_retries
+            if not config.image_fallback_poll_enabled:
+                max_poll_retries = 1
+            for poll_attempt in range(1, max_poll_retries + 1):
                 try:
                     polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                         conversation_id,
@@ -1035,9 +1041,8 @@ def stream_image_outputs(
                         "is_transient": is_transient,
                     })
                     # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                    if poll_attempt < MAX_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                        # 递增退避：30s, 60s, 90s
-                        backoff = 30.0 * poll_attempt
+                    if poll_attempt < max_poll_retries and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
+                        backoff = config.image_fallback_poll_backoff_secs * poll_attempt
                         logger.info({
                             "event": "image_model_text_reply_poll_retry",
                             "conversation_id": conversation_id,
@@ -1107,13 +1112,16 @@ def stream_image_outputs(
                 "event": "image_fallback_conversation_id_recovery_failed",
                 "error": repr(exc)[:300],
             })
-    if should_poll_for_image and conversation_id:
+    if config.image_fallback_poll_enabled and should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
-        MAX_FALLBACK_POLL_RETRIES = 3
-        for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
-            retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
+        retry_poll_timeout = max(config.image_poll_timeout_secs, config.image_fallback_poll_timeout_secs)
+        max_fallback_poll_retries = config.image_fallback_poll_max_retries
+        for poll_attempt in range(1, max_fallback_poll_retries + 1):
+            retry_wait_secs = min(
+                config.image_fallback_poll_wait_secs * poll_attempt,
+                max(config.image_poll_initial_wait_secs, config.image_fallback_poll_wait_secs) * poll_attempt,
+            )
             logger.info({
                 "event": "image_stream_retry_poll_after_wait",
                 "conversation_id": conversation_id,
@@ -1148,9 +1156,8 @@ def stream_image_outputs(
                     "is_transient": is_transient,
                 })
                 # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                if poll_attempt < MAX_FALLBACK_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                    # 递增退避：30s, 60s
-                    backoff = 30.0 * poll_attempt
+                if poll_attempt < max_fallback_poll_retries and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
+                    backoff = config.image_fallback_poll_backoff_secs * poll_attempt
                     logger.info({
                         "event": "image_stream_retry_poll_retry",
                         "conversation_id": conversation_id,

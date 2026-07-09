@@ -19,11 +19,12 @@ from services.protocol import (
     openai_v1_response,
     openai_search,
 )
+from services.protocol.conversation import default_image_model
 
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    model: str = "gpt-image-2"
+    model: str | None = None
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
@@ -96,8 +97,9 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        payload["model"] = str(payload.get("model") or default_image_model()).strip() or default_image_model()
         payload["base_url"] = resolve_image_base_url(request)
-        call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
+        call = LoggedCall(identity, "/v1/images/generations", str(payload["model"]), "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         return await call.run(openai_v1_image_generations.handle, payload)
 

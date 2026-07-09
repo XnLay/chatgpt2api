@@ -28,6 +28,7 @@ import {
   type BackupState,
   type CPAPool,
   type CPARemoteFile,
+  type ImageModel,
   type ImageStorageMode,
   type ImageStorageSettings,
   type ProxyRuntimeClearanceMode,
@@ -41,6 +42,19 @@ import {
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
+
+const IMAGE_MODEL_OPTIONS: ImageModel[] = [
+  "gpt-image-2",
+  "codex-gpt-image-2",
+  "plus-codex-gpt-image-2",
+  "team-codex-gpt-image-2",
+  "pro-codex-gpt-image-2",
+];
+
+function normalizeImageModel(value: unknown): ImageModel {
+  const model = String(value || "").trim() as ImageModel;
+  return IMAGE_MODEL_OPTIONS.includes(model) ? model : "gpt-image-2";
+}
 
 const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
   enabled: false,
@@ -175,6 +189,12 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     image_retention_days: Number(config.image_retention_days || 30),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
+    image_default_model: normalizeImageModel(config.image_default_model),
+    image_fallback_poll_enabled: Boolean(config.image_fallback_poll_enabled !== false),
+    image_fallback_poll_max_retries: Number(config.image_fallback_poll_max_retries || 3),
+    image_fallback_poll_timeout_secs: Number(config.image_fallback_poll_timeout_secs || 300),
+    image_fallback_poll_wait_secs: Number(config.image_fallback_poll_wait_secs || 30),
+    image_fallback_poll_backoff_secs: Number(config.image_fallback_poll_backoff_secs || 30),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_redundancy_multiplier: Number(config.image_redundancy_multiplier || 1.0),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
@@ -301,6 +321,12 @@ type SettingsStore = {
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
+  setImageDefaultModel: (value: ImageModel) => void;
+  setImageFallbackPollEnabled: (value: boolean) => void;
+  setImageFallbackPollMaxRetries: (value: string) => void;
+  setImageFallbackPollTimeoutSecs: (value: string) => void;
+  setImageFallbackPollWaitSecs: (value: string) => void;
+  setImageFallbackPollBackoffSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageRedundancyMultiplier: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
@@ -449,6 +475,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
+        image_default_model: normalizeImageModel(config.image_default_model),
+        image_fallback_poll_enabled: Boolean(config.image_fallback_poll_enabled !== false),
+        image_fallback_poll_max_retries: Math.max(1, Math.min(10, Number(config.image_fallback_poll_max_retries) || 3)),
+        image_fallback_poll_timeout_secs: Math.max(1, Number(config.image_fallback_poll_timeout_secs) || 300),
+        image_fallback_poll_wait_secs: Math.max(0, Number(config.image_fallback_poll_wait_secs) || 30),
+        image_fallback_poll_backoff_secs: Math.max(0, Number(config.image_fallback_poll_backoff_secs) || 30),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_redundancy_multiplier: Math.max(1.0, Number(config.image_redundancy_multiplier) || 1.0),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
@@ -551,6 +583,30 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImagePollTimeoutSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+  },
+
+  setImageDefaultModel: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_default_model: normalizeImageModel(value) } } : {});
+  },
+
+  setImageFallbackPollEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_fallback_poll_enabled: value } } : {});
+  },
+
+  setImageFallbackPollMaxRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_fallback_poll_max_retries: value } } : {});
+  },
+
+  setImageFallbackPollTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_fallback_poll_timeout_secs: value } } : {});
+  },
+
+  setImageFallbackPollWaitSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_fallback_poll_wait_secs: value } } : {});
+  },
+
+  setImageFallbackPollBackoffSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_fallback_poll_backoff_secs: value } } : {});
   },
 
   setImageAccountConcurrency: (value) => {

@@ -166,6 +166,12 @@ export type SettingsConfig = {
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
+  image_default_model?: ImageModel | string;
+  image_fallback_poll_enabled?: boolean;
+  image_fallback_poll_max_retries?: number | string;
+  image_fallback_poll_timeout_secs?: number | string;
+  image_fallback_poll_wait_secs?: number | string;
+  image_fallback_poll_backoff_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
   image_redundancy_multiplier?: number | string;

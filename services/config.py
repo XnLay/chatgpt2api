@@ -84,6 +84,15 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_IMAGE_MODEL = "gpt-image-2"
+IMAGE_DEFAULT_MODEL_OPTIONS = {
+    "gpt-image-2",
+    "codex-gpt-image-2",
+    "plus-codex-gpt-image-2",
+    "team-codex-gpt-image-2",
+    "pro-codex-gpt-image-2",
+}
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -423,6 +432,46 @@ class ConfigStore:
             return 10.0
 
     @property
+    def image_default_model(self) -> str:
+        value = str(self.data.get("image_default_model") or DEFAULT_IMAGE_MODEL).strip()
+        return value if value in IMAGE_DEFAULT_MODEL_OPTIONS else DEFAULT_IMAGE_MODEL
+
+    @property
+    def image_fallback_poll_enabled(self) -> bool:
+        value = self.data.get("image_fallback_poll_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_fallback_poll_max_retries(self) -> int:
+        try:
+            return max(1, min(10, int(self.data.get("image_fallback_poll_max_retries", 3))))
+        except (TypeError, ValueError):
+            return 3
+
+    @property
+    def image_fallback_poll_timeout_secs(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_fallback_poll_timeout_secs", 300)))
+        except (TypeError, ValueError):
+            return 300
+
+    @property
+    def image_fallback_poll_wait_secs(self) -> float:
+        try:
+            return max(0.0, float(self.data.get("image_fallback_poll_wait_secs", 30.0)))
+        except (TypeError, ValueError):
+            return 30.0
+
+    @property
+    def image_fallback_poll_backoff_secs(self) -> float:
+        try:
+            return max(0.0, float(self.data.get("image_fallback_poll_backoff_secs", 30.0)))
+        except (TypeError, ValueError):
+            return 30.0
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
@@ -568,6 +617,12 @@ class ConfigStore:
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_default_model"] = self.image_default_model
+        data["image_fallback_poll_enabled"] = self.image_fallback_poll_enabled
+        data["image_fallback_poll_max_retries"] = self.image_fallback_poll_max_retries
+        data["image_fallback_poll_timeout_secs"] = self.image_fallback_poll_timeout_secs
+        data["image_fallback_poll_wait_secs"] = self.image_fallback_poll_wait_secs
+        data["image_fallback_poll_backoff_secs"] = self.image_fallback_poll_backoff_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_redundancy_multiplier"] = self.image_redundancy_multiplier

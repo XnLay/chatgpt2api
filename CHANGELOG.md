@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## 1.7.0 - 2026-07-09
+
 + [新增] 号池管理页展示账号当前图片在途数 `image_inflight`，用于诊断并发槽位未释放问题。
 + [新增] 生图冗余倍率 `image_redundancy_multiplier`，请求多张图片时可额外并发生成候选结果并只返回所需数量。
++ [新增] 设置页新增生图默认模型与兜底轮询参数，未传 `model` 时按配置默认值执行。
++ [修复] 注册流程接入官方 Sentinel SDK 生成 `so-token`，并在 create_account 请求中提交 `openai-sentinel-so-token`。
 
 ## 1.6.0 - 2026-07-04
 

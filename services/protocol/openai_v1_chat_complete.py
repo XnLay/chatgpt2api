@@ -15,6 +15,7 @@ from services.protocol.conversation import (
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
+    default_image_model,
     encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
@@ -162,7 +163,7 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]]]:
-    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    model = str(body.get("model") or default_image_model()).strip() or default_image_model()
     prompt = extract_chat_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})

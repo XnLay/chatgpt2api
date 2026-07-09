@@ -10,7 +10,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ImageStorageMode } from "@/lib/api";
+import type { ImageModel, ImageStorageMode } from "@/lib/api";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
@@ -25,6 +25,12 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageDefaultModel = useSettingsStore((state) => state.setImageDefaultModel);
+  const setImageFallbackPollEnabled = useSettingsStore((state) => state.setImageFallbackPollEnabled);
+  const setImageFallbackPollMaxRetries = useSettingsStore((state) => state.setImageFallbackPollMaxRetries);
+  const setImageFallbackPollTimeoutSecs = useSettingsStore((state) => state.setImageFallbackPollTimeoutSecs);
+  const setImageFallbackPollWaitSecs = useSettingsStore((state) => state.setImageFallbackPollWaitSecs);
+  const setImageFallbackPollBackoffSecs = useSettingsStore((state) => state.setImageFallbackPollBackoffSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageRedundancyMultiplier = useSettingsStore((state) => state.setImageRedundancyMultiplier);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
@@ -168,6 +174,25 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">生图默认模型</label>
+            <Select
+              value={String(config?.image_default_model || "gpt-image-2")}
+              onValueChange={(value) => setImageDefaultModel(value as ImageModel)}
+            >
+              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="gpt-image-2">gpt-image-2</SelectItem>
+                <SelectItem value="codex-gpt-image-2">codex-gpt-image-2</SelectItem>
+                <SelectItem value="plus-codex-gpt-image-2">plus-codex-gpt-image-2</SelectItem>
+                <SelectItem value="team-codex-gpt-image-2">team-codex-gpt-image-2</SelectItem>
+                <SelectItem value="pro-codex-gpt-image-2">pro-codex-gpt-image-2</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-stone-500">请求未传 model 时使用；生图页面也会用它作为初始选择。</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>
             <Input
               value={String(config?.image_account_concurrency || "")}
@@ -237,6 +262,60 @@ export function ConfigCard() {
               disabled={!config?.image_settle_enabled}
             />
             <p className="text-xs text-stone-500">单位秒，找到图片后等待多久再次确认。需配合图片二次确认机制使用。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_fallback_poll_enabled !== false)}
+                onCheckedChange={(checked) => setImageFallbackPollEnabled(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">兜底轮询机制</span>
+            </div>
+            <p className="text-xs text-stone-500">SSE 结束但图片尚未落库时，继续轮询对话结果。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">兜底轮询次数</label>
+            <Input
+              value={String(config?.image_fallback_poll_max_retries || "3")}
+              onChange={(event) => setImageFallbackPollMaxRetries(event.target.value)}
+              placeholder="3"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={config?.image_fallback_poll_enabled === false}
+            />
+            <p className="text-xs text-stone-500">每次最多重新轮询一次完整超时时间。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">兜底轮询超时</label>
+            <Input
+              value={String(config?.image_fallback_poll_timeout_secs || "300")}
+              onChange={(event) => setImageFallbackPollTimeoutSecs(event.target.value)}
+              placeholder="300"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={config?.image_fallback_poll_enabled === false}
+            />
+            <p className="text-xs text-stone-500">单位秒，单次兜底轮询等待上游结果的最长时间。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">兜底轮询等待</label>
+            <Input
+              value={String(config?.image_fallback_poll_wait_secs || "30")}
+              onChange={(event) => setImageFallbackPollWaitSecs(event.target.value)}
+              placeholder="30"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={config?.image_fallback_poll_enabled === false}
+            />
+            <p className="text-xs text-stone-500">单位秒，进入兜底轮询前的递增等待基数。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">兜底失败退避</label>
+            <Input
+              value={String(config?.image_fallback_poll_backoff_secs || "30")}
+              onChange={(event) => setImageFallbackPollBackoffSecs(event.target.value)}
+              placeholder="30"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={config?.image_fallback_poll_enabled === false}
+            />
+            <p className="text-xs text-stone-500">单位秒，临时错误后下次兜底轮询前的退避基数。</p>
           </div>
           <div className="flex gap-4 md:col-span-2">
             <div className="flex-1 space-y-2">
