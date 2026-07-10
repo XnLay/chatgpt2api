@@ -6,14 +6,13 @@ import json
 import os
 import random
 import secrets
-import string
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 import urllib3
@@ -298,19 +297,6 @@ def _generate_pkce() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
-def _random_password(length: int = 16) -> str:
-    chars = string.ascii_letters + string.digits + "!@#$%"
-    value = list(
-        secrets.choice(string.ascii_uppercase)
-        + secrets.choice(string.ascii_lowercase)
-        + secrets.choice(string.digits)
-        + secrets.choice("!@#$%")
-        + "".join(secrets.choice(chars) for _ in range(max(0, length - 4)))
-    )
-    random.shuffle(value)
-    return "".join(value)
-
-
 def _random_name() -> tuple[str, str]:
     return random.choice(["James", "Robert", "John", "Michael", "David", "Mary", "Emma", "Olivia"]), random.choice(
         ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller"]
@@ -522,6 +508,26 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
 
 
+def extract_continue_url(data: dict[str, Any] | None) -> str:
+    """从 OTP 响应的已知结构中提取下一步授权地址。"""
+    if not isinstance(data, dict):
+        return ""
+    direct = str(data.get("continue_url") or data.get("continueUrl") or "").strip()
+    if direct:
+        return direct
+    page = data.get("page")
+    if isinstance(page, dict):
+        payload = page.get("payload")
+        if isinstance(payload, dict):
+            nested = str(payload.get("continue_url") or payload.get("continueUrl") or payload.get("next_url") or payload.get("nextUrl") or "").strip()
+            if nested:
+                return nested
+    session_info = data.get("oai-client-auth-session")
+    if isinstance(session_info, dict):
+        return str(session_info.get("continue_url") or session_info.get("continueUrl") or "").strip()
+    return ""
+
+
 def _extract_callback_params_from_response(resp, data: dict | None = None) -> dict[str, str] | None:
     candidates = [str((data or {}).get("continue_url") or "").strip()]
     headers = getattr(resp, "headers", {}) or {}
@@ -582,6 +588,7 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.passwordless_signup = False
 
     def close(self) -> None:
         self.session.close()
@@ -643,7 +650,8 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            "screen_hint": "signup",
+            # 官网当前注册入口统一走 Passwordless：先验证邮箱，再创建账号资料。
+            "screen_hint": "login_or_signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -666,27 +674,22 @@ class PlatformRegistrar:
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             debug = _response_debug_detail(resp)
             step(index, f"platform authorize 返回 HTTP {resp.status_code}{detail}，继续使用已建立的授权会话；{debug}", "yellow")
-        step(index, "platform authorize 完成")
+        final_url = str(getattr(resp, "url", "") or "")
+        self.passwordless_signup = "/email-verification" in final_url.lower()
+        mode = "passwordless" if self.passwordless_signup else "pending"
+        step(index, f"platform authorize 完成 mode={mode} url={final_url[:160]}")
 
-    def _register_user(self, email: str, password: str, index: int) -> None:
-        step(index, "开始提交注册密码")
+    def _start_passwordless_signup(self, index: int) -> None:
+        step(index, "开始发送 Passwordless 注册验证码")
+        url = f"{auth_base}/api/accounts/passwordless/send-otp"
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = self._build_sentinel("username_password_create", index).token
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
+        resp, error = request_with_local_retry(self.session, "post", url, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
-            raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        step(index, "提交注册密码完成")
-
-    def _send_otp(self, index: int) -> None:
-        step(index, "开始发送验证码")
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code not in (200, 302):
-            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
-        step(index, "发送验证码完成")
+            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+        self.passwordless_signup = True
+        step(index, "Passwordless 注册验证码发送完成")
 
     def _validate_otp(self, code: str, index: int) -> None:
         step(index, f"开始校验验证码 {code}")
@@ -698,7 +701,30 @@ class PlatformRegistrar:
             except Exception:
                 pass
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
+        continue_url = extract_continue_url(_response_json(resp))
+        if continue_url:
+            self._authorize_continue(continue_url, index)
         step(index, "验证码校验完成")
+
+    def _authorize_continue(self, continue_url: str, index: int) -> None:
+        """跟随 OTP 返回地址，将授权会话推进到账号资料创建阶段。"""
+        url = str(continue_url or "").strip()
+        if not url:
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            url = urljoin(f"{auth_base}/", url.lstrip("/"))
+        step(index, "开始执行 authorize/continue")
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            url,
+            headers=self._navigate_headers(f"{auth_base}/email-verification"),
+            allow_redirects=True,
+            verify=False,
+        )
+        if resp is None or resp.status_code not in (200, 302):
+            raise RuntimeError(error or f"authorize_continue_http_{getattr(resp, 'status_code', 'unknown')}")
+        step(index, f"authorize/continue 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
@@ -739,11 +765,12 @@ class PlatformRegistrar:
             raise RuntimeError("邮箱服务未返回 address")
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
-        password = _random_password()
+        password = ""
         first_name, last_name = _random_name()
         self._platform_authorize(email, index)
-        self._register_user(email, password, index)
-        self._send_otp(index)
+        if not self.passwordless_signup:
+            self._start_passwordless_signup(index)
+        step(index, "已进入 Passwordless 注册，不创建不可用的随机密码")
         step(index, "开始等待注册验证码")
         code = wait_for_code(mailbox, register_proxy=self.proxy)
         if not code:

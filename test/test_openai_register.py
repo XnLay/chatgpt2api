@@ -2,6 +2,7 @@ import json
 import os
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -167,6 +168,161 @@ class OpenAIRegisterCloudflareTests(unittest.TestCase):
         self.assertEqual(request_headers["openai-sentinel-so-token"], "so-token-value")
         self.assertEqual(registrar.platform_auth_code, "oauth-code")
         self.assertTrue(any(args == ("oai-sc", "0challenge") for args, _kwargs in registrar.session.cookies.items))
+
+
+class OpenAIRegisterPasswordlessTests(unittest.TestCase):
+    def _registrar(self, response=None):
+        registrar = openai_register.PlatformRegistrar.__new__(openai_register.PlatformRegistrar)
+        registrar.proxy = ""
+        registrar.session = _FakeSession(response or _FakeResponse())
+        registrar.device_id = "device-id"
+        registrar.code_verifier = ""
+        registrar.platform_auth_code = ""
+        registrar.passwordless_signup = False
+        return registrar
+
+    def test_platform_authorize_uses_passwordless_hint_and_detects_verification_page(self):
+        registrar = self._registrar(_FakeResponse(url="https://auth.openai.com/email-verification"))
+
+        registrar._platform_authorize("new@example.com", 1)
+
+        request_url = registrar.session.requests[0][1]
+        query = parse_qs(urlparse(request_url).query)
+        self.assertEqual(query["screen_hint"], ["login_or_signup"])
+        self.assertTrue(registrar.passwordless_signup)
+
+    def test_start_passwordless_signup_posts_current_endpoint(self):
+        registrar = self._registrar()
+
+        registrar._start_passwordless_signup(1)
+
+        method, url, kwargs = registrar.session.requests[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://auth.openai.com/api/accounts/passwordless/send-otp")
+        self.assertEqual(kwargs["headers"]["referer"], "https://auth.openai.com/create-account/password")
+        self.assertTrue(registrar.passwordless_signup)
+
+    def test_start_passwordless_signup_reports_response_detail(self):
+        registrar = self._registrar(
+            _FakeResponse(status_code=400, json_data={"error": {"code": "email_not_allowed"}})
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "email_not_allowed"):
+            registrar._start_passwordless_signup(1)
+
+    def test_validate_otp_follows_continue_url(self):
+        registrar = self._registrar()
+        otp_response = _FakeResponse(
+            json_data={"page": {"payload": {"continueUrl": "/authorize/continue?state=test"}}}
+        )
+
+        with patch.object(openai_register, "validate_otp", return_value=(otp_response, "")), patch.object(
+            registrar,
+            "_authorize_continue",
+        ) as authorize_continue:
+            registrar._validate_otp("123456", 7)
+
+        authorize_continue.assert_called_once_with("/authorize/continue?state=test", 7)
+
+    def test_extract_continue_url_supports_known_response_shapes(self):
+        self.assertEqual(
+            openai_register.extract_continue_url({"continue_url": "https://auth.openai.com/next"}),
+            "https://auth.openai.com/next",
+        )
+        self.assertEqual(
+            openai_register.extract_continue_url(
+                {"oai-client-auth-session": {"continueUrl": "/authorize/continue"}}
+            ),
+            "/authorize/continue",
+        )
+        self.assertEqual(openai_register.extract_continue_url({"page": {"payload": {}}}), "")
+
+    def test_authorize_continue_resolves_relative_url(self):
+        registrar = self._registrar(_FakeResponse(url="https://auth.openai.com/about-you"))
+
+        registrar._authorize_continue("/authorize/continue?state=test", 2)
+
+        method, url, kwargs = registrar.session.requests[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(url, "https://auth.openai.com/authorize/continue?state=test")
+        self.assertTrue(kwargs["allow_redirects"])
+
+    def test_authorize_continue_rejects_failed_response(self):
+        registrar = self._registrar(_FakeResponse(status_code=401))
+
+        with self.assertRaisesRegex(RuntimeError, "authorize_continue_http_401"):
+            registrar._authorize_continue("https://auth.openai.com/authorize/continue", 2)
+
+    def test_oauth_token_rejects_empty_code_before_request(self):
+        class _NoRequestSession:
+            def post(self, *_args, **_kwargs):
+                self.fail("不应发起 token 请求")
+
+            def fail(self, message):
+                raise AssertionError(message)
+
+        with self.assertRaisesRegex(RuntimeError, "OAuth code 为空"):
+            openai_register.request_platform_oauth_token(_NoRequestSession(), "", "verifier")
+
+    def test_create_account_rejects_missing_oauth_callback_code(self):
+        registrar = self._registrar(_FakeResponse(json_data={}))
+        artifacts = openai_register.SentinelArtifacts(token="sentinel-token")
+
+        with patch.object(registrar, "_build_sentinel", return_value=artifacts):
+            with self.assertRaisesRegex(RuntimeError, "未获得 OAuth code"):
+                registrar._create_account("Test User", "2000-01-01", 1)
+
+    def test_register_starts_passwordless_flow_and_keeps_password_empty(self):
+        registrar = self._registrar()
+        tokens = {"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
+
+        with patch.object(
+            openai_register,
+            "create_mailbox",
+            return_value={"address": "new@example.com", "label": "test"},
+        ), patch.object(openai_register, "wait_for_code", return_value="123456"), patch.object(
+            registrar,
+            "_platform_authorize",
+        ), patch.object(registrar, "_start_passwordless_signup") as start_passwordless, patch.object(
+            registrar,
+            "_validate_otp",
+        ), patch.object(registrar, "_create_account"), patch.object(
+            registrar,
+            "_exchange_registered_tokens",
+            return_value=tokens,
+        ):
+            result = registrar.register(1)
+
+        start_passwordless.assert_called_once_with(1)
+        self.assertEqual(result["password"], "")
+        self.assertEqual(result["access_token"], "access")
+
+    def test_register_does_not_send_duplicate_otp_after_direct_verification_landing(self):
+        registrar = self._registrar()
+        tokens = {"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
+
+        def authorize(_email, _index):
+            registrar.passwordless_signup = True
+
+        with patch.object(
+            openai_register,
+            "create_mailbox",
+            return_value={"address": "new@example.com", "label": "test"},
+        ), patch.object(openai_register, "wait_for_code", return_value="123456"), patch.object(
+            registrar,
+            "_platform_authorize",
+            side_effect=authorize,
+        ), patch.object(registrar, "_start_passwordless_signup") as start_passwordless, patch.object(
+            registrar,
+            "_validate_otp",
+        ), patch.object(registrar, "_create_account"), patch.object(
+            registrar,
+            "_exchange_registered_tokens",
+            return_value=tokens,
+        ):
+            registrar.register(1)
+
+        start_passwordless.assert_not_called()
 
 
 class OpenAIRegisterEnvConfigTests(unittest.TestCase):
